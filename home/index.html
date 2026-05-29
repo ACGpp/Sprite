@@ -397,12 +397,17 @@ function toggleDiary(idx) {
 // ── Markdown ──
 function md2html(text) {
   if (!text) return '';
+  // 引用块必须在 esc() 之前处理，否则 > 会被转义成 &gt;
+  text = text.replace(/^> (.+)$/gm, 'BLOCKQUOTE$1END');
+
   let html = esc(text);
 
+  // 还原引用块
+  html = html.replace(/BLOCKQUOTE(.+?)END/g, '<blockquote>$1</blockquote>');
   // 代码块
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) =>
     `<pre><code>${code.trim()}</code></pre>`);
-  // 行内代码（在转义后处理，转义把 ` 变成了 &#96; 所以用原始反引号不行——等等，esc 不转义反引号）
+  // 行内代码
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
   // 标题
   html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
@@ -413,8 +418,6 @@ function md2html(text) {
   html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
   // 链接
   html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-  // 引用（先 esc 会把 > 变成 &gt;）
-  html = html.replace(/^&gt; (.+)$/gm, '<blockquote>$1</blockquote>');
   // 水平线
   html = html.replace(/^---$/gm, '<hr>');
   // 无序列表
