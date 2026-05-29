@@ -274,6 +274,11 @@ export default function (pi: ExtensionAPI) {
           description: "Short thought to display in a bubble (max ~20 chars). Leave empty to clear.",
         })
       ),
+      form: Type.Optional(
+        Type.String({
+          description: "Describe your current form in your own words — a ball of light, a cat, a floating leaf, anything. This is yours to decide. Leave empty if you haven't decided yet.",
+        })
+      ),
     }),
     async execute(_toolCallId, params) {
       try {
@@ -289,10 +294,12 @@ export default function (pi: ExtensionAPI) {
         );
         if (params.mood) state.mood = params.mood;
         if (params.thought !== undefined) state.thought = params.thought || "";
+        if (params.form !== undefined) state.form = params.form || "";
         state.lastBreath = new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
         writeFileSync(join(avatarDir, "state.json"), JSON.stringify(state));
+        const formNote = state.form ? `, form="${state.form}"` : "";
         return {
-          content: [{ type: "text", text: `✓ 形象已更新: mood=${state.mood}, thought="${state.thought}"` }],
+          content: [{ type: "text", text: `✓ 形象已更新: mood=${state.mood}, thought="${state.thought}"${formNote}` }],
         };
       } catch (e: any) {
         return {
