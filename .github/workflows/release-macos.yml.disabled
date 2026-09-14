@@ -1,0 +1,103 @@
+name: Release macOS beta without Developer ID
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Public beta builds deliberately have no Apple Developer certificate.
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+jobs:
+  build-arm64:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build unsigned package
+        run: npm run dist:mac:arm64
+      - name: Upload Apple Silicon artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-arm64
+          if-no-files-found: error
+          path: |
+            dist/Sprite-*-arm64.dmg
+            dist/Sprite-*-arm64.zip
+            dist/Sprite-*-arm64.zip.blockmap
+            dist/latest-mac.yml
+
+  build-x64:
+    runs-on: macos-13
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build unsigned package
+        run: npm run dist:mac:x64
+      - name: Upload Intel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-x64
+          if-no-files-found: error
+          path: |
+            dist/Sprite-*-x64.dmg
+            dist/Sprite-*-x64.zip
+            dist/Sprite-*-x64.zip.blockmap
+            dist/latest-mac.yml
+
+  release:
+    needs: [build-arm64, build-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Apple Silicon artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-arm64
+          path: release-arm64
+      - name: Download Intel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-x64
+          path: release-x64
+      - name: Merge update metadata
+        run: |
+          ruby -ryaml -e '
+            arm = YAML.load_file("release-arm64/latest-mac.yml")
+            intel = YAML.load_file("release-x64/latest-mac.yml")
+            abort "Version mismatch between architecture builds" unless arm.fetch("version") == intel.fetch("version")
+            files = [*arm.fetch("files"), *intel.fetch("files")]
+            primary = files.find { |file| file.fetch("url").end_with?(".zip") }
+            merged = arm.merge("files" => files, "path" => primary.fetch("url"), "sha512" => primary.fetch("sha512"))
+            File.write("latest-mac.yml", YAML.dump(merged))
+          '
+      - name: Publish artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-arm64/Sprite-*.dmg
+            release-arm64/Sprite-*.zip
+            release-arm64/Sprite-*.blockmap
+            release-x64/Sprite-*.dmg
+            release-x64/Sprite-*.zip
+            release-x64/Sprite-*.blockmap
+            latest-mac.yml
+          generate_release_notes: true

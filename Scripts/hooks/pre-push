@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# 拦住"把私人内容推上去"的推送。
+#
+# 本地 main 是完整开发线：docs/ 里有主人的私人对话叙述，历史里还留着脱敏前的样例。
+# 直接 `git push origin main` 会把这些一起公开，而且推上去就收不回来——
+# 所以这个钩子对**每一次推送的每个引用**跑一遍隐私闸门（Scripts/privacy-scan.py）。
+#
+# 发布代码的正确姿势是 Scripts/publish-code.sh --push：它只推脱敏后的代码快照，
+# 那个快照能通过闸门，所以钩子不会拦它。
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$repo_root"
+
+# 闸门只针对**公开**仓库（origin = ACGpp/Sprite）。
+# 私人备份仓库（例如 ACGpp/Sprite-dev）本来就该带文档、评审与真实经历——
+# 在那里拦下来等于不让备份，所以只提示一句就放行。
+remote_url="${2:-}"
+case "$remote_url" in
+	*ACGpp/Sprite.git*) : ;;
+	*)
+		echo "（推送到非公开仓库 ${remote_url}：跳过公开闸门——私人备份应当完整）" >&2
+		exit 0
+		;;
+esac
+
+fail=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+	# 删除远端分支时 local_sha 是全零，不用扫
+	case "$local_sha" in 0000000000000000000000000000000000000000) continue ;; esac
+	log="$(mktemp -t sprite-privacy-push.XXXXXX)"
+	if ! python3 Scripts/privacy-scan.py . "$local_sha" >"$log" 2>&1; then
+		echo "✗ 隐私闸门未通过：这次要推的内容里有私人材料（完整输出：${log}）" >&2
+		grep -E "✗|═══" "$log" >&2 || true
+		echo "  只发布代码请用：Scripts/publish-code.sh --push" >&2
+		fail=1
+	fi
+done
+
+if [ "$fail" != "0" ]; then
+	exit 1
+fi
