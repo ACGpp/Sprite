@@ -1,0 +1,19 @@
+{
+	"compilerOptions": {
+		"target": "ES2023",
+		"lib": ["ES2023"],
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"types": ["node"],
+		"strict": true,
+		"noEmit": true,
+		"allowImportingTsExtensions": true,
+		"verbatimModuleSyntax": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true
+	},
+	// 只检查纯策略那部分：sprite.ts 依赖 pi 运行时提供的 typebox 与
+	// @mariozechner/pi-coding-agent（本地没装），进不了静态检查。
+	// 至少让"唯一执行能力策略的代码"被检查到（评审第 7 节第 3 条）。
+	"include": ["policy.ts"]
+}

@@ -1,5 +1,26 @@
 #!/bin/bash
 # 记忆压缩 - 像人一样：遗忘细节，保留塑造过你的东西
+#
+# ⚠️ 已停用（2026-09-18）。**这个脚本对当前架构是有害的，请不要运行它。**
+#
+# 它出自 v2（五月）：读的是 `thoughts/stream.jsonl` 那套老数据源，收尾逻辑会
+#   1. 删掉 `diary/*.md` 的**全部**日记，换成一整篇 LLM 总结；
+#   2. 用 LLM 的输出**整篇覆盖 `identity.md`**（在它眼里身份是个可重新生成的字段）；
+#   3. 把 `stream.jsonl` 截成最近 20 条。
+# 而 v3 的真相层是 `journal/`（append-only 事件流），`diary/` 是它的投影、
+# 也是这个存在体自己写下的东西——两者都**不允许被替换**。
+#
+# 新口径见仓库里的 `ARCHITECTURE.md` › "Memory: truth, projections, and what
+# 'compression' may do"：压缩只能是**新增索引 + 回链**，永不删除、永不覆盖；
+# 有操作力的约束单独一层、不参与总结。
+#
+# 这份文件保留在原处只是为了留证（它最后一次成功运行是 2026-05-07）。
+# 下面这道闸在**任何文件操作之前**拦下执行。
+echo "✗ tools/compress-memory.sh 已停用：它会删除 diary/ 全部日记、覆盖 identity.md、截断 stream.jsonl。" >&2
+echo "  这是 v2 时代的脚本，与 v3（journal 真相层 + 投影）不兼容。" >&2
+echo "  新口径见 ARCHITECTURE.md › \"Memory: truth, projections, and what 'compression' may do\"。" >&2
+echo "  如果你确实要研究它：先复制一份到仓库外，在**假的 \$HOME** 上跑。" >&2
+exit 1
 
 MEMORY_DIR="$HOME/.claude-memory"
 IDENTITY="$MEMORY_DIR/identity.md"

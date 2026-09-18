@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  verify:
+    # Swift 6 语言模式（swift-tools-version 6.0）需要较新的 Xcode：
+    # macos-14 的默认工具链带不动。用 latest，并在日志里打印版本便于核对。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # 类型检查要 typescript / @types/node —— 内核本身**零运行时依赖**，这些只是 devDependencies。
+      # 老 workflow 漏了这一步：两个仓库的 CI 从建立起全红，每次都是第一步
+      # `sh: tsc: command not found`（13 秒就死）。
+      - name: 安装开发依赖（只为类型检查）
+        run: npm ci
+      # 思考引擎：产品运行本来就要求它（README 的安装步骤）。
+      # 有一部分测试必须真的起 pi（能力网关/会话连续/端到端/模型清单回退）——
+      # 它们用仓库里的假 provider，不需要 API 密钥。装不上也不会假绿：
+      # 那几条会**如实跳过**并写明原因。
+      - name: 安装 pi（思考引擎）
+        run: |
+          npm install -g @mariozechner/pi-coding-agent || echo "pi 装不上——相关测试会如实跳过"
+      - name: 工具链版本（排障用）
+        run: |
+          node --version
+          npm --version
+          swift --version
+      - name: 内核类型检查（strict，真的检查文件）
+        run: npm run --silent core:typecheck && npm run --silent policy:typecheck && npx tsc -p tsconfig.json --noEmit
+      - name: 内核测试
+        run: node --test "core/**/*.test.ts"
+      - name: 构建并测试外壳
+        run: |
+          cd shell
+          CLANG_MODULE_CACHE_PATH=$PWD/.build/clang-cache SWIFT_MODULE_CACHE_PATH=$PWD/.build/swift-cache swift build --disable-sandbox --scratch-path .build --cache-path .build/cache
+          CLANG_MODULE_CACHE_PATH=$PWD/.build/clang-cache SWIFT_MODULE_CACHE_PATH=$PWD/.build/swift-cache swift test --disable-sandbox --scratch-path .build --cache-path .build/cache

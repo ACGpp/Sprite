@@ -6,3 +6,32 @@ config/llm.conf
 __pycache__/
 *.pyc
 avatar/
+node_modules/
+dist/
+dist-electron/
+out/
+release/
+.playwright-cli/
+output/
+build/icon.iconset/
+
+# spike 沙箱与临时产物（可复现，不入库）
+.spike/**/home/
+.spike/**/run/
+.spike/run/
+.spike/out/
+.spike/swift-module-cache/
+
+# 内核测试临时目录
+.core-test/
+
+# 原生外壳的构建产物（.build* 全挡：.build-release 曾漏网，把带绝对路径的缓存提交了进去）
+shell/.build/
+shell/.build-release/
+dist-shell/
+
+# 演示用的记忆副本（不入库：里面有主人的私人记忆）
+.demo/
+
+# 清理前的自动备份
+.cleanup-backup/
