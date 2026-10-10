@@ -6,6 +6,7 @@ import SwiftUI
 /// 为什么必须唯一：有一类问题（布局死循环）**只在真实窗口里**才出现——
 /// 离屏渲染（`--shot`）不会触发。所以真实应用与 `--hang-check` 必须走同一条构造路径，
 /// 否则检查器检的是另一套配置，等于没检。
+@MainActor
 enum RecordsWindow {
 	/// 建一个记录窗口（不显示）。
 	static func make(model: ShellModel, section: RecordsView.Section) -> NSWindow {

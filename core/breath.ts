@@ -12,8 +12,9 @@
 import type { PiAgent, PiEvent } from "./agent/pi-rpc.ts";
 import { shanghaiClock } from "./projections.ts";
 import type { Journal } from "./journal.ts";
-import { deriveState } from "./state.ts";
+import { deriveState, type KernelState } from "./state.ts";
 import { truncate } from "./text.ts";
+import { failureDiagnostic, type FailureCode } from "./failure-diagnostics.ts";
 
 export type BreathTrigger = "timer" | "message" | "wake" | "recovered-queue" | "manual";
 
@@ -21,6 +22,7 @@ export type BreathOutcome = {
 	runId: string | null;
 	ok: boolean;
 	busy?: boolean;
+	restartRequired?: boolean;
 	reason?: string;
 	durationMs: number;
 	activities: number;
@@ -29,6 +31,9 @@ export type BreathOutcome = {
 
 export type BreathDeps = {
 	journal: Journal;
+	getState?: () => KernelState;
+	cancelTimeoutMs?: number;
+	sanitizeError?: (text: string) => string;
 	pi: PiAgent;
 	isQuiet: () => boolean;
 	/** 内核补的"时间感与由头"（它自己不知道过了多久、今天说过几句） */
@@ -40,11 +45,14 @@ export type BreathDeps = {
 
 export type BreathRunner = {
 	readonly running: boolean;
+	readonly retired: boolean;
+	cancel(reason?: string): Promise<void>;
 	run(trigger: BreathTrigger): Promise<BreathOutcome>;
 };
 
 export type ObservationInput = {
 	pending: string[];
+	bootstrap?: string;
 	quiet: boolean;
 	at: Date;
 	/** 距离它上一次开口过了多久（小时）——它自己不知道时间，就得由内核告诉它 */
@@ -139,166 +147,215 @@ export function buildObservation(observationInput: ObservationInput): string {
 
 最近用户留言（空表示没有新留言，今天的对话上下文 session 里已有，无需重读）：
 ${recent}
-${heldBackBlock}${viewBlock}${factsBlock}${context.length > 0 ? `\n${context.join("\n")}` : ""}
+${heldBackBlock}${observationInput.bootstrap ? `\n${observationInput.bootstrap}\n` : ""}${viewBlock}${factsBlock}${context.length > 0 ? `\n${context.join("\n")}` : ""}
 ${quietNote}
 你想做什么？`;
 }
 
 export function createBreathRunner(deps: BreathDeps): BreathRunner {
-	const { journal, pi, isQuiet, observationExtras, timeoutMs = 120_000, now = () => new Date(), log = () => {} } = deps;
-
+	const { journal, pi, isQuiet, observationExtras, timeoutMs = 120_000, cancelTimeoutMs = 2_000,
+		now = () => new Date(), log = () => {}, sanitizeError = (text: string) => text } = deps;
+	type Terminal = "agent_end" | "timeout" | "cancelled" | "exited";
+	type Active = {
+		runId: string; activities: number; thought: string | null; error: string | null;
+		substantiveActivities: number;
+		tools: Map<string, { tool: string; path?: string }>;
+		retrying: boolean; ended: boolean; cancelled: string | null;
+		exitCode?: number | null;
+		settle: (terminal: Terminal) => void; endedPromise: Promise<void>; end: () => void;
+	};
 	let running = false;
-	let active: {
-		runId: string;
-		activities: number;
-		thought: string | null;
-		settle: (outcome: "agent_end" | "timeout") => void;
-	} | null = null;
+	let retired = false;
+	let active: Active | null = null;
+	let finished: Promise<void> = Promise.resolve();
+	let finish: () => void = () => {};
 
-	pi.onEvent((event: PiEvent) => {
-		if (!active) return;
-		// 关停途中仍可能有在途事件到达（此时 journal 已关闭）：绝不能让它把进程带崩。
-		const record = (type: Parameters<typeof journal.append>[0], data: Record<string, unknown>) => {
-			try {
-				return journal.append(type, data);
-			} catch (error) {
-				log(`[breath] 丢弃在途事件（${type}）: ${error instanceof Error ? error.message : String(error)}`);
-				return null;
+	const record = (type: Parameters<typeof journal.append>[0], data: Record<string, unknown>) => {
+		try { return journal.append(type, data); }
+		catch (error) { log(`[breath] 丢弃在途事件（${type}）: ${sanitizeError(String(error))}`); return null; }
+	};
+	function assistantResult(message: unknown, current: Active) {
+		const value = message as { role?: string; content?: unknown; stopReason?: string; errorMessage?: string } | undefined;
+		if (value?.role !== "assistant") return;
+		current.error = value.stopReason === "error" || value.stopReason === "aborted"
+			? sanitizeError(`模型 ${value.stopReason}: ${value.errorMessage ?? "没有完成本轮"}`) : null;
+		if (!Array.isArray(value.content)) return;
+		const text = value.content.filter((block): block is { type: string; text: string } =>
+			block?.type === "text" && typeof block.text === "string").map(block => block.text).join("").trim();
+		if (text && current.thought !== text) {
+			current.thought = text;
+			record("thought.recorded", { text, runId: current.runId });
+		}
+	}
+	pi.onEvent(event => {
+		const current = active;
+		if (!current) return;
+		if (event.type === "_process_exit") {
+			current.exitCode = typeof event.code === "number" ? event.code : null;
+			current.end(); current.settle("exited"); return;
+		}
+		if (event.type === "agent_end") {
+			current.ended = true;
+			current.end();
+			if (Array.isArray(event.messages)) {
+				const last = [...event.messages].reverse().find(message => message?.role === "assistant");
+				if (last) assistantResult(last, current);
 			}
-		};
+			// pi emits agent_end before auto_retry_start. An RPC round trip is a
+			// stream barrier, so retries emitted in the same processing pass are
+			// observed before treating this event as terminal (no timing heuristic).
+			void (pi.flushEvents?.() ?? Promise.resolve()).then(() => {
+				if (active === current && !current.retrying) current.settle("agent_end");
+			}, () => { if (active === current) current.settle("exited"); });
+			return;
+		}
+		if (current.cancelled) return;
 		switch (event.type) {
-			case "tool_execution_start": {
-				active.activities += 1;
-				record("run.activity", {
-					kind: "tool",
-					tool: String(event.toolName ?? "unknown"),
-					summary: truncate(JSON.stringify(event.args ?? {}), 200),
-					runId: active.runId,
-				});
-				return;
-			}
-			case "message_end": {
-				const message = event.message as { role?: string; content?: unknown } | undefined;
-				if (message?.role !== "assistant" || !Array.isArray(message.content)) return;
-				const text = message.content
-					.filter((block): block is { type: string; text: string } => {
-						const candidate = block as { type?: string; text?: string };
-						return candidate.type === "text" && typeof candidate.text === "string";
-					})
-					.map((block) => block.text)
-					.join("")
-					.trim();
-				if (text) {
-					active.thought = text;
-					record("thought.recorded", { text, runId: active.runId });
+			case "auto_retry_start": current.retrying = true; current.ended = false; return;
+			case "auto_retry_end":
+				current.retrying = false;
+				if (event.success === false) {
+					current.error = sanitizeError(`模型重试失败: ${String(event.finalError ?? "unknown")}`);
+					current.settle("agent_end");
 				}
 				return;
+			case "tool_execution_start":
+				current.activities += 1;
+				if (event.toolName !== "set_next_breath") current.substantiveActivities += 1;
+				if (typeof event.toolCallId === "string") {
+					const args = event.args as { path?: unknown } | undefined;
+					current.tools.set(event.toolCallId, { tool: String(event.toolName ?? "unknown"),
+						...(typeof args?.path === "string" ? { path: args.path } : {}) });
+				}
+				record("run.activity", { kind: "tool", tool: String(event.toolName ?? "unknown"),
+					summary: truncate(JSON.stringify(event.args ?? {}), 200), runId: current.runId,
+					...(typeof event.toolCallId === "string" ? { toolCallId: event.toolCallId } : {}) });
+				return;
+			case "tool_execution_end": {
+				const id = typeof event.toolCallId === "string" ? event.toolCallId : "";
+				const tool = current.tools.get(id);
+				if (!tool) return; // Ignore duplicates and results from another run.
+				current.tools.delete(id);
+				const result = event.result as { details?: { ok?: unknown; verified?: unknown } } | undefined;
+				const success = event.isError === false && result?.details?.ok !== false;
+				// Persist outcome metadata, never raw tool output (which may contain secrets).
+				record("tool.finished", { ...tool, toolCallId: id, runId: current.runId, success,
+					verified: success && result?.details?.verified === true });
+				return;
 			}
-			case "agent_end":
-				active.settle("agent_end");
-				return;
-			default:
-				return;
+			case "message_end": assistantResult(event.message, current); return;
 		}
 	});
 
+	async function stopCurrent(current: Active) {
+		retired = true;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const deadline = new Promise<void>(resolve => { timer = setTimeout(resolve, cancelTimeoutMs); });
+			const abort = pi.send({ id: `${current.runId}-abort`, type: "abort" }, cancelTimeoutMs).then(() => current.endedPromise, () => {});
+			await Promise.race([abort, deadline]);
+		} finally { if (timer) clearTimeout(timer); }
+		// A new process is required even after a cooperative abort: pi's events
+		// have no runId, so an old event cannot safely be assigned to a new turn.
+		await pi.terminate?.();
+	}
 	return {
-		get running() {
-			return running;
+		get running() { return running; },
+		get retired() { return retired; },
+		async cancel(reason = "运行已取消") {
+			retired = true;
+			if (active) { active.cancelled = reason; active.settle("cancelled"); await finished; }
+			else await pi.terminate?.();
 		},
-
 		async run(trigger) {
-			if (running) {
-				log(`[breath] 已有呼吸在跑，${trigger} 触发被拒绝`);
-				return { runId: null, ok: false, busy: true, durationMs: 0, activities: 0, thought: null };
-			}
+			if (running || retired) return { runId: null, ok: false, busy: running, restartRequired: retired,
+				reason: retired ? "引擎已停止，需要重建" : "已有呼吸在跑", durationMs: 0, activities: 0, thought: null };
 			running = true;
+			finished = new Promise(resolve => { finish = resolve; });
 			const startedAt = Date.now();
 			const runId = `run-${journal.seq + 1}`;
-			const quiet = isQuiet();
-
-			// 顺序至关重要：观察必须在写 run.started **之前**取。
-			// pendingMessages 的判据是"seq > 上一次 run.started"，若先写 run.started，
-			// 这一拍刚到达的留言会被算成"上一拍已读"，观察就空了——留言被静默吞掉。
-			//
-			// try 必须**从取观察之前**就开始：老写法里 running=true 在 try 之外，
-			// 只要取观察这一段抛一次错（例如 observationExtras 里的扫描），
-			// running 会永远为真——它再也不呼吸，而且没有任何自愈。
-			let state: ReturnType<typeof deriveState> | null = null;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			let started = false;
+			let delivered = false;
+			let outcomeUnknown = false;
+			let failureCode: FailureCode | undefined;
 			try {
-				state = deriveState(journal.events);
+				const state = deps.getState?.() ?? deriveState(journal.events);
+				const pending = [...state.pendingMessages];
+				const quiet = isQuiet();
 				const extras = observationExtras?.() ?? {};
-				const observation = buildObservation({
-					pending: state.pendingMessages.map((message) => message.text),
-					quiet,
-					at: now(),
-					...extras,
-				});
-
-				// 把"这一拍它被告知了什么"写进日志：提示词不是黑箱，事后能查
-				journal.append("run.started", {
-					trigger,
-					runId,
-					quiet,
-					nudge: extras.nudge ?? null,
-					// 安静时段收着几句：审计里要能看出这一拍被告知了什么
-					heldBack: extras.heldBack?.length ?? 0,
-					silenceHours: extras.silenceHours ?? null,
-					proactiveToday: extras.proactiveToday ?? null,
-				});
+				const observation = buildObservation({ ...extras, pending: pending.map(message => message.text), quiet, at: now() });
+				journal.append("run.started", { trigger, runId, quiet, claimedMessageSeqs: pending.map(message => message.seq),
+					nudge: extras.nudge ?? null, heldBack: extras.heldBack?.length ?? 0,
+					silenceHours: extras.silenceHours ?? null, proactiveToday: extras.proactiveToday ?? null });
+				started = true;
 				journal.append("presence.changed", { state: "thinking", runId });
-
-				// settle 必须在对象创建时就存在：靠"Promise 执行器恰好同步执行"来补字段
-				// 是类型不安全的（类型检查器早就指出来了）。
-				let settle!: (outcome: "agent_end" | "timeout") => void;
-				const settled = new Promise<"agent_end" | "timeout">((resolve) => {
-					settle = resolve;
-				});
-				const current = { runId, activities: 0, thought: null as string | null, settle };
+				let resolveTerminal!: (terminal: Terminal) => void;
+				let interrupt!: (terminal: Terminal) => void;
+				const settled = new Promise<Terminal>(resolve => { resolveTerminal = resolve; });
+				const interrupted = new Promise<Terminal>(resolve => { interrupt = resolve; });
+				const settle = (terminal: Terminal) => {
+					resolveTerminal(terminal);
+					if (terminal !== "agent_end") interrupt(terminal);
+				};
+				let end!: () => void;
+				const endedPromise = new Promise<void>(resolve => { end = resolve; });
+				const current: Active = { runId, activities: 0, thought: null, error: null,
+					substantiveActivities: 0, tools: new Map(),
+					retrying: false, ended: false, cancelled: null, settle, endedPromise, end };
 				active = current;
-				const timer = setTimeout(() => settle("timeout"), timeoutMs);
-
-				// 送达与否要如实记录：被拒的 prompt 意味着**它根本没看到这句话**
-				let delivered = false;
-				try {
-					const response = await pi.send({ id: runId, type: "prompt", message: observation });
-					if (response.success === false) throw new Error(`prompt 被拒绝: ${JSON.stringify(response).slice(0, 200)}`);
+				timer = setTimeout(() => settle("timeout"), timeoutMs);
+				// Race prompt acknowledgement too: a hung RPC must not outlive the run deadline.
+				outcomeUnknown = true;
+				const acknowledgement = pi.send({ id: runId, type: "prompt", message: observation }).then(response => ({ response }));
+				const accepted = await Promise.race([acknowledgement, interrupted.then(terminal => ({ terminal }))]);
+				let terminal: Terminal;
+				if ("response" in accepted) {
+					if (accepted.response.success === false) {
+						outcomeUnknown = false;
+						throw new Error(`prompt 被拒绝: ${sanitizeError(String(accepted.response.error ?? "unknown"))}`);
+					}
 					delivered = true;
-
-					const how = await settled;
-					if (how === "timeout") throw new Error(`呼吸超时（${timeoutMs}ms）`);
-
-					journal.append("run.finished", { runId, durationMs: Date.now() - startedAt, activities: current.activities });
-					return {
-						runId,
-						ok: true,
-						durationMs: Date.now() - startedAt,
-						activities: current.activities,
-						thought: current.thought,
-					};
-				} catch (error) {
-					const reason = error instanceof Error ? error.message : String(error);
-					// delivered=false 时读模型会把这一拍"看到的"留言退回待处理——
-					// 否则用户的话被静默吞掉：它没看到，而队列已经清了。
-					journal.append("run.failed", { runId, reason, durationMs: Date.now() - startedAt, delivered });
-					log(`[breath] 失败: ${reason}`);
-					return { runId, ok: false, reason, durationMs: Date.now() - startedAt, activities: current.activities, thought: current.thought };
-				} finally {
-					clearTimeout(timer);
-					active = null;
+					outcomeUnknown = false;
+					terminal = await settled;
+				} else {
+					terminal = accepted.terminal;
+					outcomeUnknown = true;
 				}
+				if (terminal === "timeout" || terminal === "cancelled") {
+					failureCode = terminal === "cancelled" ? "run_cancelled" : "run_timeout";
+					current.cancelled ??= terminal === "timeout" ? `呼吸超时（${timeoutMs}ms）` : "运行已取消";
+					outcomeUnknown = true;
+					await stopCurrent(current);
+					throw new Error(current.cancelled);
+				}
+				if (terminal === "exited") { retired = true; outcomeUnknown = true; throw new Error("思考引擎在运行完成前退出"); }
+				if (current.error) throw new Error(current.error);
+				journal.append("run.finished", { runId, durationMs: Date.now() - startedAt, activities: current.activities,
+					substantiveActivities: current.substantiveActivities });
+				return { runId, ok: true, durationMs: Date.now() - startedAt, activities: current.activities, thought: current.thought };
 			} catch (error) {
-				// 取观察/写 run.started 这一段抛错：如实记一条，然后**一定要让 running 归位**
-				const reason = error instanceof Error ? error.message : String(error);
-				log(`[breath] 呼吸准备阶段失败: ${reason}`);
-				try {
-					journal.append("system.problem", { code: "breath.prepare", userMessage: `这一拍没能开始：${reason}` });
-				} catch {
-					// 日志也写不进去就只能放弃记录，但 running 必须复位
+				const reason = sanitizeError(error instanceof Error ? error.message : String(error));
+				// Capture the original exit before cancellation itself terminates pi.
+				failureCode ??= active?.exitCode !== undefined
+					? active.exitCode === 78 ? "memory_context_failed" : "pi_exited"
+					: failureDiagnostic({ reason, outcomeUnknown }).failureCode;
+				if (outcomeUnknown && active && !retired) {
+					active.cancelled = reason;
+					await stopCurrent(active);
 				}
-				return { runId, ok: false, reason, durationMs: Date.now() - startedAt, activities: 0, thought: null };
+				if (started) {
+					record("run.failed", { runId, reason, failureCode, durationMs: Date.now() - startedAt, delivered, outcomeUnknown });
+				}
+				else record("system.problem", { code: "breath.prepare", userMessage: `这一拍没能开始：${reason}` });
+				log(`[breath] 失败: ${reason}`);
+				return { runId, ok: false, reason, restartRequired: retired, durationMs: Date.now() - startedAt,
+					activities: active?.activities ?? 0, thought: active?.thought ?? null };
 			} finally {
+				if (timer) clearTimeout(timer);
+				active = null;
 				running = false;
+				finish();
 			}
 		},
 	};

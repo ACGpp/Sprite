@@ -1,19 +1,24 @@
 /**
  * Sprite 能力网关（跑在 pi 进程内的扩展）。
  *
- * 它是 agent 与世界之间唯一的门：
- *   - 每一次工具调用都留痕（tool.decided），危险动作直接拒绝
- *   - 写操作限制在允许的根目录里（默认只有记忆之家）；读操作放行但留痕
+ * 它为 pi 的工具提供内核鉴权与审计：
+ *   - 每一次工具调用都留痕（tool.decided），按当前档位鉴权
+ *   - 专用记忆工具经版本存储；full 模式另提供 pi 的 bash，可联网和操作本地文件
  *   - 它想说话/留话/改节奏/提问，都必须经内核决定，不能自己直接动 UI 或文件
  *
- * 内核是唯一的写入者：本扩展不写任何记忆文件，只发能力请求。
+ * 专用记忆写入由内核处理；full 模式的 bash 是独立的通用执行能力，不受记忆路径白名单约束。
  * 通信：Unix socket（内核的 gateway.sock），行分隔 JSON。
  */
 
 import { connect } from "node:net";
+import path from "node:path";
+import fs from "node:fs";
+import { createBashToolDefinition, createGrepToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { ALLOWED_ROOTS, DANGEROUS_BASH, MAX_SAYS_PER_RUN, inAllowedRoot, isSecretPath } from "./policy.ts";
+import { MEMORY_HOME, MAX_SAYS_PER_RUN, isReadableMemoryPath, isSecretPath, readableSearchFiles } from "./policy.ts";
+import { registerMemory } from "./memory.ts";
+import { createManagedBashOperations } from "./shell.ts";
 
 const GATEWAY_SOCK = process.env.SPRITE_GATEWAY_SOCK ?? "";
 
@@ -35,7 +40,7 @@ function askCore(payload: Record<string, unknown>, timeoutMs = 5000): Promise<Re
 		};
 		socket.setEncoding("utf8");
 		socket.setTimeout(timeoutMs);
-		socket.on("connect", () => socket.write(`${JSON.stringify(payload)}\n`));
+		socket.on("connect", () => socket.write(`${JSON.stringify({ ...payload, ...(process.env.SPRITE_AGENT_GENERATION ? { generation: process.env.SPRITE_AGENT_GENERATION } : {}) })}\n`));
 		socket.on("data", (chunk) => {
 			buffer += chunk;
 			const index = buffer.indexOf("\n");
@@ -52,6 +57,32 @@ function askCore(payload: Record<string, unknown>, timeoutMs = 5000): Promise<Re
 }
 
 export default function spriteGateway(pi: ExtensionAPI) {
+	registerMemory(pi, askCore);
+	if (process.env.SPRITE_AGENT_SHELL === "full") pi.registerTool(createBashToolDefinition(process.cwd(), { operations: createManagedBashOperations() }));
+	// Built-in grep follows links and searches settings beneath a permitted parent.
+	// Keep pi's matcher/formatting, but enumerate only policy-approved regular files.
+	const grep = createGrepToolDefinition(MEMORY_HOME);
+	if (process.env.SPRITE_AGENT_SHELL !== "off") pi.registerTool({
+		...grep,
+		async execute(id, params, signal, onUpdate, ctx) {
+			const files = readableSearchFiles(params.path ?? ".", MEMORY_HOME, params.glob);
+			const chunks: string[] = [];
+			const limit = Math.max(1, Math.min(1000, params.limit ?? 100));
+			let lines = 0;
+			for (const file of files) {
+				if (signal?.aborted) throw new Error("Operation aborted");
+				// Recheck immediately before each actual read, including realpath.
+				if (isSecretPath(file) || fs.lstatSync(file).isSymbolicLink()) continue;
+				const result = await grep.execute(id, { ...params, path: file, glob: undefined, limit: limit - lines }, signal, undefined, ctx);
+				const text = result.content.filter(item => item.type === "text").map(item => item.text).join("\n");
+				if (!text || text === "No matches found") continue;
+				chunks.push(`${path.relative(MEMORY_HOME, file)}:\n${text}`);
+				lines += text.split("\n").length;
+				if (lines >= limit || chunks.join("\n").length >= 50_000) break;
+			}
+			return { content: [{ type: "text", text: chunks.join("\n").slice(0, 50_000) || "No matches found" }], details: undefined };
+		},
+	});
 	let saysThisRun = 0;
 	pi.on("before_agent_start", () => {
 		saysThisRun = 0;
@@ -122,6 +153,8 @@ export default function spriteGateway(pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event) => {
 		const input = event.input as Record<string, unknown>;
+		const authorization = await askCore({ kind: "tool.authorize", tool: event.toolName, input: String(input.path ?? input.command ?? "").slice(0, 200) });
+		if (authorization.ok !== true) return { block: true, reason: String(authorization.error ?? "当前权限不允许执行工具") };
 
 		// 说话节流放在这里而不是 execute 里：pi 的 tool_call 是**顺序预检**，
 		// 而 execute 是并发执行——在 execute 里计数会有竞态。
@@ -140,32 +173,13 @@ export default function spriteGateway(pi: ExtensionAPI) {
 			return undefined;
 		}
 
-		if (event.toolName === "bash") {
-			const command = String(input.command ?? "");
-			const dangerous = DANGEROUS_BASH.find((pattern) => pattern.test(command));
-			if (dangerous) {
-				await askCore({ kind: "tool.decided", tool: "bash", decision: "block", reason: "危险命令", input: command.slice(0, 200) });
-				return { block: true, reason: "这个命令太危险了，被策略拦下。换个做法，或者问用户。" };
-			}
-			await askCore({ kind: "tool.decided", tool: "bash", decision: "allow", input: command.slice(0, 200) });
-			return undefined;
-		}
-
-		if (event.toolName === "write" || event.toolName === "edit") {
-			const target = String(input.path ?? input.file_path ?? "");
-			if (target && !inAllowedRoot(target)) {
-				await askCore({ kind: "tool.decided", tool: event.toolName, decision: "block", reason: "路径越界", input: target });
-				return { block: true, reason: `只能在自己的记忆目录里写东西，${target} 不在允许范围内。` };
-			}
-			await askCore({ kind: "tool.decided", tool: event.toolName, decision: "allow", input: target });
-			return undefined;
-		}
+		// write/edit are overrides implemented by the kernel's versioned memory store.
 
 		// 密钥文件（config/settings.json、llm.conf）与内核运行时：读也不许。
 		// 没有哪条正当理由需要它读自己的 API key——这一条是"不主动递钥匙"。
 		const candidate = String(input.path ?? input.file_path ?? input.command ?? "");
-		if ((event.toolName === "read" || event.toolName === "grep" || event.toolName === "find" || event.toolName === "ls") && isSecretPath(candidate)) {
-			await askCore({ kind: "tool.decided", tool: event.toolName, decision: "block", reason: "密钥/内核文件", input: candidate.slice(0, 200) });
+		if (["read", "grep", "find", "ls", "write", "edit", "memory_propose"].includes(event.toolName) && !isReadableMemoryPath(candidate || ".")) {
+			await askCore({ kind: "tool.decided", tool: event.toolName, decision: "block", reason: "路径越界或受保护文件", input: candidate.slice(0, 200) });
 			return { block: true, reason: "这个文件里是它自己的密钥或内核运行时数据，不能读。" };
 		}
 

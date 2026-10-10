@@ -9,3 +9,12 @@
 # v2 的记忆压缩脚本里的提示词模板（产品文案；v3 已不再用它整理记忆）
 你是一个正在整理自己记忆的
 将所有日记压缩成一篇总结
+# Public runtime diagnostics (core/breath.ts and core/failure-diagnostics.ts).
+思考引擎在运行完成前退出
+# Public quiet-hours observation template (core/main.ts and its regression test).
+你昨夜收着的那几句在下面
+# Version-conflict approval UI copy (core/main.ts and synthetic shell fixture).
+文件版本变化后必须重新确认
+# Public fail-closed context budget errors (core/memory-context.ts).
+模型上下文预算无效或已耗尽
+约定和未决状态无法放入当前模型上下文

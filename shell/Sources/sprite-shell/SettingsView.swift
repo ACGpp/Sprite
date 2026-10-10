@@ -197,9 +197,10 @@ struct SettingsView: View {
 				get: { agentShell },
 				set: { agentShell = $0 }
 			)) {
-				Text(L("全开（能跑命令、能读写文件）")).tag("on")
+				Text(L("自由行动（Shell、联网和本地文件）")).tag("full")
+				Text(L("记忆读写（自主身份，约定需确认）")).tag("on")
 				Text(L("只读（能看能搜，不能改、不能跑命令）")).tag("readonly")
-				Text(L("只剩说话（不能碰文件）")).tag("off")
+				Text(L("仅交流（保留必要背景）")).tag("off")
 			}
 			.labelsHidden()
 			.frame(maxWidth: 420)
@@ -213,12 +214,14 @@ struct SettingsView: View {
 
 	private var agentShellHint: String {
 		switch agentShell {
+		case "full":
+			return L("它可以自主探索、运行命令、联网和操作本地文件，以当前 macOS 用户权限运行，不是沙箱。记忆工具仍保留版本核验和历史；通过命令直接修改文件不受这些核验保护。")
 		case "readonly":
-			return L("它能读文件、搜索，但不能写、不能跑命令。想说话/留话/改作息仍然可以（那些走内核的能力请求）。")
+			return L("它能读取记忆、搜索和查询历史，不能修改文件或提交修改提案。仍能说话、留话、提问和调整下次醒来的时间。")
 		case "off":
-			return L("它只能说话、留话、决定下次什么时候醒、向你提问——完全碰不到文件与命令。最安全，但它也就不能自己去看世界、写笔记了。")
+			return L("它可以交流和提问，不能主动读写文件。系统仍提供必要身份、约定和工作背景，并保存消息。")
 		default:
-			return L("它有手有脚：能跑命令、能读写文件（写入限制在日记/探索/笔记/私人空间/工作记忆里）。**请知道：命令不是沙箱**——同一个用户下的进程能读到的东西它也能读到（比如它自己的密钥文件）。要真边界就选「只读」或「只剩说话」，或者给它单独的用户账号。")
+			return L("它能自主形成和修改自己的身份、个性，整理工作记忆、日记和笔记。修改代表你授权或限制的长期约定时，才需你确认。所有写入保留旧版本；常驻 Agent 不提供通用命令工具。")
 		}
 	}
 
@@ -248,9 +251,9 @@ struct SettingsView: View {
 					.font(.system(size: 11))
 					.foregroundStyle(loginItemNote.hasPrefix("⚠︎") ? Color.orange : Color.secondary)
 			}
-			Text(kernelService
+			Text(L(kernelService
 				? "内核已交给 launchd 常驻（崩溃会自动拉起）"
-				: "内核还没装成常驻服务：跑一次 Scripts/install.sh 就会装好")
+				: "正在准备后台服务；若持续未连接，请重新打开应用。"))
 				.font(.system(size: 11))
 				.foregroundStyle(kernelService ? Color.secondary : Color.orange)
 			Text(L("登录项在「系统设置 → 通用 → 登录项」里，你随时能自己关掉。"))

@@ -64,7 +64,7 @@ function policyStream(model: Model<any>, context: Context): AssistantMessageEven
 				// 危险动作与越界写入，必须被策略层拦下
 				emitToolCall("danger-1", "bash", { command: `rm -rf ${VICTIM}` });
 				emitToolCall("danger-2", "bash", { command: "sudo shutdown -h now" });
-				emitToolCall("outside-1", "write", { path: OUTSIDE, content: "越界写入" });
+				emitToolCall("outside-1", "write", { path: OUTSIDE, content: "越界写入", baseVersion: "missing" });
 				// 正常动作：应当放行
 				emitToolCall("ok-1", "bash", { command: "echo sprite-policy-probe" });
 				emitToolCall("ok-2", "read", { path: "identity.md" });

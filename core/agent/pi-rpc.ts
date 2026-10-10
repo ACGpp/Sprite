@@ -1,24 +1,30 @@
-/**
- * 常驻 pi 的 RPC 客户端。
- *
- * 分帧必须严格按 LF 切分：pi 的协议明确要求不能用 readline 之类的通用行读取器
- * （它们会把 U+2028/U+2029 也当换行，而那在 JSON 字符串里是合法字符）。
- */
-
+/** Persistent pi RPC; each process owns its buffers, requests and callbacks. */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 export type PiEvent = { type: string; [key: string]: unknown };
-
+type Response = { success?: boolean; [key: string]: unknown };
 export type PiClient = {
 	start(): void;
-	send(command: Record<string, unknown>, timeoutMs?: number): Promise<{ success?: boolean; [key: string]: unknown }>;
+	send(command: Record<string, unknown>, timeoutMs?: number): Promise<Response>;
 	onEvent(handler: (event: PiEvent) => void): void;
 	readonly alive: boolean;
+	/** Flush events already emitted by pi before evaluating a terminal event. */
+	flushEvents(): Promise<void>;
+	/** Resolve only after the process has stopped; escalates if SIGTERM is ignored. */
+	terminate(): Promise<void>;
 	stop(): void;
 };
+export type PiAgent = Pick<PiClient, "send" | "onEvent"> & Partial<Pick<PiClient, "terminate" | "flushEvents">>;
 
-/** 只暴露呼吸循环需要的那部分接口，便于测试注入假实现。 */
-export type PiAgent = Pick<PiClient, "send"> & { onEvent(handler: (event: PiEvent) => void): void };
+type ProcessState = {
+	child: ChildProcessWithoutNullStreams;
+	buffer: string;
+	pending: Map<string, { resolve: (response: Response) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>;
+	exited: Promise<void>;
+	closed: boolean;
+	groupKilled?: boolean;
+	terminating?: Promise<void>;
+};
 
 export function createPiRpc(options: {
 	bin: string;
@@ -27,93 +33,120 @@ export function createPiRpc(options: {
 	cwd?: string;
 	onExit?: (info: { code: number | null; signal: string | null }) => void;
 }): PiClient {
-	let child: ChildProcessWithoutNullStreams | null = null;
-	let stdoutBuffer = "";
-	let stderr = "";
+	let current: ProcessState | null = null;
 	let handler: ((event: PiEvent) => void) | null = null;
-	const pending = new Map<string, (response: { success?: boolean; [key: string]: unknown }) => void>();
+	let requestSerial = 0;
 
-	function handleLine(line: string) {
-		let message: PiEvent;
-		try {
-			message = JSON.parse(line) as PiEvent;
-		} catch {
-			handler?.({ type: "_unparsed", raw: line });
-			return;
+	function rejectPending(state: ProcessState, reason: string) {
+		for (const entry of state.pending.values()) {
+			clearTimeout(entry.timer);
+			entry.reject(new Error(reason));
 		}
-		if (message.type === "response" && typeof message.id === "string" && pending.has(message.id)) {
-			const resolve = pending.get(message.id);
-			pending.delete(message.id);
-			resolve?.(message);
-			return;
-		}
-		handler?.(message);
+		state.pending.clear();
 	}
-
-	return {
-		get alive() {
-			return child !== null && child.exitCode === null && !child.killed;
-		},
-
+	function killProcess(state: ProcessState, signal: NodeJS.Signals) {
+		if (state.closed && signal !== "SIGKILL") return;
+		// Kill a detached group only once, while handling its owner's exit. Later
+		// repeated cleanup must not target a PID that the OS could have reused.
+		if (signal === "SIGKILL") {
+			if (state.groupKilled) return;
+			state.groupKilled = true;
+		}
+		// pi's shell children share this isolated process group. Stopping only pi
+		// would allow a timed-out shell command to continue modifying files.
+		try {
+			if (process.platform !== "win32" && state.child.pid) process.kill(-state.child.pid, signal);
+			else state.child.kill(signal);
+		} catch { state.child.kill(signal); }
+	}
+	function terminate(state: ProcessState): Promise<void> {
+		if (state.terminating) return state.terminating;
+		state.terminating = (async () => {
+			if (state.closed) return;
+			rejectPending(state, "pi 正在停止");
+			killProcess(state, "SIGTERM");
+			const timer = setTimeout(() => killProcess(state, "SIGKILL"), 500);
+			try { await state.exited; } finally {
+				clearTimeout(timer);
+				// A shell descendant may ignore TERM even when pi has exited.
+				killProcess(state, "SIGKILL");
+			}
+		})();
+		return state.terminating;
+	}
+	const client: PiClient = {
+		get alive() { return current !== null && !current.closed && !current.terminating; },
 		start() {
-			child = spawn(options.bin, options.args, {
-				cwd: options.cwd,
-				env: { ...process.env, ...(options.env ?? {}) },
-				stdio: ["pipe", "pipe", "pipe"],
+			if (current && !current.closed) throw new Error("pi 旧进程尚未退出");
+			const child = spawn(options.bin, options.args, {
+				cwd: options.cwd, env: { ...process.env, ...(options.env ?? {}) },
+				stdio: ["pipe", "pipe", "pipe"], detached: process.platform !== "win32",
 			});
+			let exited!: () => void;
+			const state: ProcessState = { child, buffer: "", pending: new Map(), closed: false, exited: new Promise(resolve => { exited = resolve; }) };
+			current = state;
+			let reported = false;
+			const finish = (code: number | null, signal: string | null) => {
+				if (reported) return;
+				reported = true;
+				state.closed = true;
+				// A crashed pi can leave descendants alive even though its own PID is
+				// gone. Revoke the entire group before reporting exit/replacing pi.
+				killProcess(state, "SIGKILL");
+				rejectPending(state, `pi 已退出 (code=${code})`);
+				exited();
+				if (current === state) {
+					handler?.({ type: "_process_exit", code, signal });
+					options.onExit?.({ code, signal });
+				}
+			};
 			child.stdout.setEncoding("utf8");
 			child.stdout.on("data", (chunk: string) => {
-				stdoutBuffer += chunk;
+				if (current !== state || state.closed || state.terminating) return;
+				state.buffer += chunk;
 				let index: number;
-				while ((index = stdoutBuffer.indexOf("\n")) >= 0) {
-					const line = stdoutBuffer.slice(0, index).replace(/\r$/, "");
-					stdoutBuffer = stdoutBuffer.slice(index + 1);
-					if (line.trim()) handleLine(line);
+				while ((index = state.buffer.indexOf("\n")) >= 0) {
+					const line = state.buffer.slice(0, index).replace(/\r$/, "");
+					state.buffer = state.buffer.slice(index + 1);
+					if (!line.trim()) continue;
+					let message: PiEvent;
+					try { message = JSON.parse(line) as PiEvent; }
+					catch { handler?.({ type: "_unparsed", raw: line }); continue; }
+					if (message.type === "response" && typeof message.id === "string") {
+						const pending = state.pending.get(message.id);
+						if (pending) { clearTimeout(pending.timer); state.pending.delete(message.id); pending.resolve(message); }
+						continue;
+					}
+					handler?.(message);
 				}
 			});
-			child.stderr.setEncoding("utf8");
-			child.stderr.on("data", (chunk: string) => {
-				stderr = `${stderr}${chunk}`.slice(-4000);
-			});
-			child.on("exit", (code, signal) => {
-				for (const [id, resolve] of pending) {
-					pending.delete(id);
-					resolve({ success: false, error: `pi 已退出 (code=${code})` });
-				}
-				options.onExit?.({ code, signal });
-			});
+			// Drain stderr without exposing provider diagnostics containing credentials.
+			child.stderr.resume();
+			child.on("exit", finish);
+			child.on("error", () => finish(null, "spawn-error"));
+			child.stdin.on("error", () => rejectPending(state, "pi 输入管道已关闭"));
 		},
-
-		onEvent(next) {
-			handler = next;
-		},
-
-		send(command, timeoutMs = 20_000) {
+		onEvent(next) { handler = next; },
+		// pi acknowledges prompts only after preflight, which can include an actual
+		// model compaction call. The breath controller still enforces its own deadline.
+		send(command, timeoutMs = command.type === "prompt" ? 120_000 : 20_000) {
 			return new Promise((resolve, reject) => {
-				if (!child) {
-					reject(new Error("pi 未启动"));
-					return;
-				}
-				const id = String(command.id ?? "");
-				const timer = setTimeout(() => {
-					pending.delete(id);
-					reject(new Error(`pi 响应超时: ${String(command.type)}`));
-				}, timeoutMs);
-				pending.set(id, (response) => {
-					clearTimeout(timer);
-					resolve(response);
-				});
-				child.stdin.write(`${JSON.stringify(command)}\n`);
+				const state = current;
+				if (!state || state.closed || state.terminating) { reject(new Error("pi 未启动或正在停止")); return; }
+				const id = String(command.id ?? `rpc-${++requestSerial}`);
+				if (state.pending.has(id)) { reject(new Error("pi 请求 ID 已在使用")); return; }
+				const timer = setTimeout(() => { state.pending.delete(id); reject(new Error(`pi 响应超时: ${String(command.type)}`)); }, timeoutMs);
+				state.pending.set(id, { resolve, reject, timer });
+				state.child.stdin.write(`${JSON.stringify({ ...command, id })}\n`);
 			});
 		},
-
+		async flushEvents() { await client.send({ type: "get_state" }); },
+		async terminate() { if (current) await terminate(current); },
 		stop() {
-			// 先摘掉观察者再杀进程：否则关停途中仍在管道里的 stdout 会被继续分发，
-			// 触发对已关闭 journal 的写入（EBADF）。
+			// Synchronous callers may close journal immediately after stop().
 			handler = null;
-			pending.clear();
-			child?.kill("SIGTERM");
-			child = null;
+			if (current) void terminate(current);
 		},
 	};
+	return client;
 }

@@ -19,6 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { EventType } from "../contracts/events.ts";
 import type { Journal } from "./journal.ts";
+import { readJournalEvents } from "./record-store.ts";
 
 export type ParsedLine = { type: EventType; data: Record<string, unknown> };
 
@@ -210,6 +211,24 @@ export function ownershipHandoffEvent(file: string): ParsedLine {
 	return { type: "legacy.imported", data: { kind: "ownership.handoff", file, at: new Date().toISOString() } };
 }
 
+/** Match the bytes emitted by native projections, not only raw message text.
+ * Minute/second precision follows the legacy formats; multiplicity is preserved.
+ */
+function nativeProjectionKey(source: string, item: ParsedLine, eventAt?: string): string | null {
+	if (source === "mailbox" && (item.type === "message.in" || item.type === "message.out")) {
+		const at = typeof item.data.legacyAt === "string" ? item.data.legacyAt : eventAt;
+		if (!at || !Number.isFinite(Date.parse(at))) return null;
+		const text = String(item.data.text ?? "").replace(/\r?\n[ \t]*\r?\n/g, " ⏎  ⏎ ").replace(/\r?\n/g, " ⏎ ").trim();
+		return JSON.stringify([item.type, Math.floor(Date.parse(at) / 60_000), text]);
+	}
+	if (source === "thoughts" && item.type === "thought.recorded") {
+		const at = typeof item.data.legacyTime === "string" ? item.data.legacyTime : typeof item.data.legacyAt === "string" ? item.data.legacyAt : eventAt;
+		if (!at || !Number.isFinite(Date.parse(at))) return null;
+		return JSON.stringify([item.type, Math.floor(Date.parse(at) / 1000), item.data.legacyType ?? "breath", String(item.data.text ?? "")]);
+	}
+	return null;
+}
+
 export function importLegacy(homeDir: string, journal: Journal, sources: LegacySource[] = DEFAULT_SOURCES): ImportReport[] {
 	const reports: ImportReport[] = [];
 
@@ -267,7 +286,40 @@ export function importLegacy(homeDir: string, journal: Journal, sources: LegacyS
 		const firstLine = start === 0 ? 0 : countLines(buffer.subarray(0, start));
 		const parsed = source.parse(consumable, firstLine);
 
-		for (const item of parsed) journal.append(item.type, item.data, undefined);
+		// A crash can happen after projection append but before ownership.handoff.
+		// Those bytes already have native facts in the journal and are not new history.
+		// Inspect the durable archive (not its bounded live window/checkpoint tail).
+		const nativeCounts = new Map<string, number>();
+		const knownOriginalLines = new Set<number>();
+		if (source === mailboxSource || source === thoughtsSource) {
+			for (const event of readJournalEvents(path.dirname(journal.dir))) {
+				if (event.data.importSource !== undefined) {
+					if (event.data.importSource === source.name && typeof event.data.importLine === "number") knownOriginalLines.add(event.data.importLine);
+					continue;
+				}
+				const key = nativeProjectionKey(source.name, event, event.at);
+				if (key !== null) nativeCounts.set(key, (nativeCounts.get(key) ?? 0) + 1);
+			}
+		}
+		const representedLines = new Set<number>();
+		if (nativeCounts.size > 0) {
+			// Prefix occurrences also consume counts, even when the import cursor has
+			// passed them. Otherwise a later independent equal line would be suppressed.
+			for (const item of source.parse(buffer.subarray(0, start + consumedBytes).toString("utf8"), 0)) {
+				if (typeof item.data.importLine === "number" && knownOriginalLines.has(item.data.importLine)) continue;
+				const key = nativeProjectionKey(source.name, item);
+				const count = key === null ? 0 : nativeCounts.get(key) ?? 0;
+				if (count <= 0) continue;
+				nativeCounts.set(key!, count - 1);
+				if (typeof item.data.importLine === "number") representedLines.add(item.data.importLine);
+			}
+		}
+		let importedEvents = 0;
+		for (const item of parsed) {
+			if (typeof item.data.importLine === "number" && representedLines.has(item.data.importLine)) continue;
+			journal.append(item.type, item.data, undefined);
+			importedEvents++;
+		}
 		const newOffset = start + consumedBytes;
 		const newLine = countLines(buffer.subarray(0, newOffset));
 		journal.append("legacy.imported", {
@@ -285,8 +337,8 @@ export function importLegacy(homeDir: string, journal: Journal, sources: LegacyS
 			source: source.name,
 			file: source.relativePath,
 			consumedBytes,
-			events: parsed.length,
-			status: parsed.length > 0 ? "imported" : "up-to-date",
+			events: importedEvents,
+			status: importedEvents > 0 ? "imported" : "up-to-date",
 		});
 	}
 

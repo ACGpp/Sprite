@@ -28,6 +28,7 @@ public struct SpriteEvent: Decodable, Equatable, Sendable {
 
 	public enum KnownEventType: String {
 		case presenceChanged = "presence.changed"
+		case identityChanged = "identity.changed"
 		case messageIn = "message.in"
 		case messageOut = "message.out"
 		case thoughtRecorded = "thought.recorded"
@@ -38,7 +39,9 @@ public struct SpriteEvent: Decodable, Equatable, Sendable {
 		case breathScheduled = "breath.scheduled"
 		case wakeDeferred = "wake.deferred"
 		case toolDecided = "tool.decided"
+		case toolFinished = "tool.finished"
 		case questionAsked = "question.asked"
+		case questionAnswered = "question.answered"
 		case commandApplied = "command.applied"
 		case legacyImported = "legacy.imported"
 		case systemProblem = "system.problem"
@@ -68,13 +71,15 @@ public enum PresenceState: String, Decodable, Sendable {
 }
 
 public struct IncomingMessage: Decodable, Equatable, Sendable {
+	public let id: String?
 	public let text: String
 	public let source: String
 	public let seq: Int
 	public let at: String
 	public let imported: Bool?
 
-	public init(text: String, source: String, seq: Int, at: String, imported: Bool? = nil) {
+	public init(text: String, source: String, seq: Int, at: String, imported: Bool? = nil, id: String? = nil) {
+		self.id = id
 		self.text = text
 		self.source = source
 		self.seq = seq
@@ -115,18 +120,31 @@ public struct RunActivity: Decodable, Equatable, Sendable {
 	}
 }
 
-public struct PendingQuestion: Decodable, Equatable, Sendable {
+public struct PendingQuestion: Decodable, Equatable, Sendable, Identifiable {
+	public let questionId: String
+	public var id: String { questionId }
 	public let question: String
 	public let options: [String]
 	public let seq: Int
 	public let at: String
 
-	public init(question: String, options: [String], seq: Int, at: String) {
+	public init(question: String, options: [String], seq: Int, at: String, questionId: String? = nil) {
+		self.questionId = questionId ?? "question-\(seq)"
 		self.question = question
 		self.options = options
 		self.seq = seq
 		self.at = at
 	}
+	public init(from decoder: Decoder) throws {
+		let values = try decoder.container(keyedBy: CodingKeys.self)
+		seq = try values.decode(Int.self, forKey: .seq)
+		at = try values.decode(String.self, forKey: .at)
+		question = try values.decode(String.self, forKey: .question)
+		options = try values.decodeIfPresent([String].self, forKey: .options) ?? []
+		questionId = try values.decodeIfPresent(String.self, forKey: .questionId) ?? "question-\(seq)"
+	}
+	private enum CodingKeys: String, CodingKey { case questionId, question, options, seq, at }
+
 }
 
 /// 它今天（上海日）做了什么——内核数出来的事实，界面只负责显示。
@@ -168,11 +186,19 @@ public struct TodayActivity: Decodable, Equatable, Sendable {
 	}
 }
 
+public struct UnsettledMessages: Decodable, Equatable, Sendable, Identifiable {
+	public let runId: String
+	public let messages: [IncomingMessage]
+	public let reason: String
+	public var id: String { runId }
+}
+
 public struct KernelState: Decodable, Equatable, Sendable {
 	public let presence: PresenceState
 	public let nextBreathAt: String?
 	public let messages: [IncomingMessage]
 	public let pendingMessages: [IncomingMessage]
+	public let unsettledMessages: [UnsettledMessages]
 	public let outgoing: [OutgoingMessage]
 	public let thoughts: [String]
 	public let activities: [RunActivity]
@@ -207,12 +233,14 @@ public struct KernelState: Decodable, Equatable, Sendable {
 		problems: [String],
 		companionName: String? = nil,
 		today: TodayActivity? = nil,
-		idleStreak: Int = 0
+		idleStreak: Int = 0,
+		unsettledMessages: [UnsettledMessages] = []
 	) {
 		self.presence = presence
 		self.nextBreathAt = nextBreathAt
 		self.messages = messages
 		self.pendingMessages = pendingMessages
+		self.unsettledMessages = unsettledMessages
 		self.outgoing = outgoing
 		self.thoughts = thoughts
 		self.activities = activities
@@ -237,6 +265,7 @@ public struct KernelState: Decodable, Equatable, Sendable {
 		self.nextBreathAt = try? container.decodeIfPresent(String.self, forKey: .nextBreathAt)
 		self.messages = (try? container.decode([IncomingMessage].self, forKey: .messages)) ?? []
 		self.pendingMessages = (try? container.decode([IncomingMessage].self, forKey: .pendingMessages)) ?? []
+		self.unsettledMessages = (try? container.decode([UnsettledMessages].self, forKey: .unsettledMessages)) ?? []
 		self.outgoing = (try? container.decode([OutgoingMessage].self, forKey: .outgoing)) ?? []
 		self.thoughts = (try? container.decode([String].self, forKey: .thoughts)) ?? []
 		self.activities = (try? container.decode([RunActivity].self, forKey: .activities)) ?? []
@@ -254,6 +283,7 @@ public struct KernelState: Decodable, Equatable, Sendable {
 
 	private enum CodingKeys: String, CodingKey {
 		case presence, nextBreathAt, messages, pendingMessages, outgoing, thoughts, activities
+		case unsettledMessages
 		case questions, toolDecisions, deferrals, runs, danglingRun, failures, problems
 		case companionName, today, idleStreak
 	}

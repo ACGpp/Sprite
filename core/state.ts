@@ -7,10 +7,10 @@
 
 import type { JournalEvent, PresenceState } from "../contracts/events.ts";
 
-export type IncomingMessage = { text: string; source: "text" | "voice"; seq: number; at: string; imported: boolean };
+export type IncomingMessage = { id?: string; text: string; source: "text" | "voice"; seq: number; at: string; imported: boolean };
 export type OutgoingMessage = { text: string; channel: "bubble" | "digest"; seq: number; at: string; imported: boolean };
 export type RunActivity = { kind: string; tool?: string; summary?: string; runId?: string; seq: number; at: string };
-export type PendingQuestion = { question: string; options: string[]; seq: number; at: string };
+export type PendingQuestion = { questionId: string; question: string; options: string[]; seq: number; at: string };
 
 /**
  * 读模型的滑动窗口大小。
@@ -39,6 +39,9 @@ export type KernelState = {
 	lastRunStartSeq: number;
 	/** 还没结算的 run.started 的 seq 栈：提示词没送达时要把留言退回待处理 */
 	runStartSeqs: number[];
+	/** Exact durable batches, independent of the recent-message window. */
+	claimedRuns: Record<string, IncomingMessage[]>;
+	unsettledMessages: Array<{ runId: string; messages: IncomingMessage[]; reason: string }>;
 	failures: string[];
 	problems: string[];
 	importedLines: number;
@@ -63,6 +66,8 @@ export function emptyState(): KernelState {
 		danglingRun: false,
 		lastRunStartSeq: 0,
 		runStartSeqs: [],
+		claimedRuns: {},
+		unsettledMessages: [],
 		failures: [],
 		problems: [],
 		importedLines: 0,
@@ -89,7 +94,9 @@ export function applyEvent(state: KernelState, event: JournalEvent, window: numb
 			state.nextBreathAt = typeof data.nextBreathAt === "string" ? data.nextBreathAt : null;
 			break;
 		case "message.in": {
+			if (typeof data.questionId === "string") state.questions = state.questions.filter(question => question.questionId !== data.questionId);
 			const message: IncomingMessage = {
+				...(typeof data.id === "string" ? { id: data.id } : {}),
 				text: String(data.text ?? ""),
 				source: data.source === "voice" ? "voice" : "text",
 				seq: event.seq,
@@ -144,12 +151,16 @@ export function applyEvent(state: KernelState, event: JournalEvent, window: numb
 			break;
 		case "question.asked":
 			state.questions.push({
+				questionId: typeof data.questionId === "string" ? data.questionId : `question-${event.seq}`,
 				question: String(data.question ?? ""),
 				options: Array.isArray(data.options) ? data.options.map(String) : [],
 				seq: event.seq,
 				at: event.at,
 			});
-			state.trimmed += trim(state.questions, 20);
+			// 未回答的问题是持久待办，不能被展示缓存窗口静默淘汰。
+			break;
+		case "question.answered":
+			state.questions = state.questions.filter(question => question.questionId !== data.questionId);
 			break;
 		case "wake.deferred":
 			state.deferrals += 1;
@@ -158,36 +169,38 @@ export function applyEvent(state: KernelState, event: JournalEvent, window: numb
 			state.runs += 1;
 			state.danglingRun = true;
 			state.lastRunStartSeq = event.seq;
-			// 这一拍开始之前到达的留言先按"已被看到"处理；但如果提示词**根本没送到**引擎，
-			// 紧接着的 run.failed(delivered:false) 会把它们放回待处理（见下）。
 			state.runStartSeqs.push(event.seq);
-			state.pendingMessages = state.pendingMessages.filter((message) => message.seq > event.seq);
+			const runId = String(data.runId ?? `legacy-${event.seq}`);
+			// Old journals are replayed through their actual run boundaries. Never infer
+			// a retry batch from the bounded display cache or the previous successful run.
+			const claimed = Array.isArray(data.claimedMessageSeqs) ? new Set(data.claimedMessageSeqs) : null;
+			state.claimedRuns[runId] = state.pendingMessages.filter(message => claimed ? claimed.has(message.seq) : message.seq < event.seq);
+			const seqs = new Set(state.claimedRuns[runId]!.map(message => message.seq));
+			state.pendingMessages = state.pendingMessages.filter(message => !seqs.has(message.seq));
 			break;
 		}
 		case "run.finished":
-			state.danglingRun = false;
+		case "run.failed": {
+			const runId = typeof data.runId === "string" ? data.runId : Object.keys(state.claimedRuns).at(-1);
+			const batch = runId ? state.claimedRuns[runId] ?? [] : [];
+			if (runId) delete state.claimedRuns[runId];
+			state.danglingRun = Object.keys(state.claimedRuns).length > 0;
 			state.runStartSeqs.pop();
-			break;
-		case "run.failed":
-			state.danglingRun = false;
-			// 引擎根本没收到这句话（prompt 被拒/发送失败）→ 留言不算被看到，放回待处理。
-			// 否则用户的话会被静默吞掉：它没看到，而队列已经清了。
-			if (data.delivered === false) {
-				state.runStartSeqs.pop();
-				const backTo = state.runStartSeqs.length > 0 ? state.runStartSeqs[state.runStartSeqs.length - 1]! : 0;
-				state.lastRunStartSeq = backTo;
-				for (const message of state.messages) {
-					if (message.imported) continue;
-					if (message.seq > backTo && !state.pendingMessages.some((existing) => existing.seq === message.seq)) {
-						state.pendingMessages.push(message);
-					}
+			if (event.type === "run.failed") {
+				if (data.delivered === false && data.outcomeUnknown !== true) {
+					const pending = new Map(state.pendingMessages.map(message => [message.seq, message]));
+					for (const message of batch) pending.set(message.seq, message);
+					state.pendingMessages = [...pending.values()].sort((a, b) => a.seq - b.seq);
+				} else if (batch.length > 0) {
+					// The engine may already have performed external work. Keep the exact
+					// unresolved batch visible, but do not automatically replay side effects.
+					state.unsettledMessages.push({ runId: runId!, messages: batch, reason: String(data.reason ?? "unknown") });
 				}
-			} else {
-				state.runStartSeqs.pop();
+				state.failures.push(String(data.reason ?? "unknown"));
+				state.trimmed += trim(state.failures, window);
 			}
-			state.failures.push(String(data.reason ?? "unknown"));
-			state.trimmed += trim(state.failures, window);
 			break;
+		}
 		case "system.problem":
 			state.problems.push(String(data.userMessage ?? data.code ?? "unknown"));
 			state.trimmed += trim(state.problems, window);
@@ -224,12 +237,13 @@ export function createStateTracker(window: number = DEFAULT_WINDOW) {
 			if (typeof snapshot !== "object" || snapshot === null) return false;
 			const candidate = snapshot as Partial<KernelState>;
 			const requiredArrays: Array<keyof KernelState> = [
-				"messages", "pendingMessages", "outgoing", "thoughts", "thoughtTimeline", "activities", "questions", "failures", "problems",
+				"messages", "pendingMessages", "outgoing", "thoughts", "thoughtTimeline", "activities", "questions", "failures", "problems", "unsettledMessages",
 			];
 			for (const key of requiredArrays) {
 				if (!Array.isArray(candidate[key])) return false;   // 结构不符 → 让调用方重扫
 			}
 			if (typeof candidate.presence !== "string") return false;
+			if (!candidate.claimedRuns || typeof candidate.claimedRuns !== "object" || Array.isArray(candidate.claimedRuns)) return false;
 			if (candidate.runStartSeqs !== undefined && !Array.isArray(candidate.runStartSeqs)) return false;
 			state = { ...emptyState(), ...candidate } as KernelState;
 			return true;

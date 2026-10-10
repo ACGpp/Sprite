@@ -1,147 +1,69 @@
 # Contributing
 
-> 中文版见 [CONTRIBUTING.zh.md](CONTRIBUTING.zh.md)。
+[中文](CONTRIBUTING.zh.md) · [Architecture](ARCHITECTURE.md) · [First run](FIRST_RUN.md)
 
-First, what this project is — three pieces:
+Sprite consists of a Node kernel (`core/`), a native SwiftUI shell (`shell/`), shared contracts (`contracts/`), and pi extensions (`pi-extension/`). The kernel owns the event journal and dedicated memory writes. The shell uses local JSON-RPC rather than reading memory files.
 
-- **`core/`** — the kernel. Memory, personality, the breathing schedule, and the agent runtime.
-  It is the **only writer**: every fact goes into an append-only JSONL journal, and the markdown
-  files (diary, conversation log) are just projections of it.
-- **`shell/`** — a native macOS menu-bar app (SwiftUI). It **never reads memory files**; it talks to
-  the kernel over a local Unix socket using JSON-RPC. The contract lives in `contracts/`.
-- **`pi-extension/`** — the policy layer for the agent's "hands and feet": which paths it may read or
-  write, which commands it may run.
+## Design rules
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) for the full picture. If you want to try the app as a user
-first, [FIRST_RUN.md](FIRST_RUN.md) is a checklist for the first day — that is genuinely the most
-useful thing you can do early on.
+1. **Keep durable facts and authored content.** The journal is append-only. Conversation and thought projections can be rebuilt; original diaries, notes and recordings cannot all be reconstructed from it. Context compaction must not delete originals or replace them with summaries.
+2. **Respect the write boundary.** Application code writes journal events through the kernel. Dedicated memory tools use version checks and durable receipts. Full mode deliberately allows shell access with OS-user permissions: this is autonomy, not a sandbox. Do not mistake prompt text, a proposal or old conversation for new authorization.
+3. **Keep private data out of Git.** Do not commit real identities, conversations, API keys, machine-specific home paths or build output. Use synthetic test fixtures.
 
-## Two invariants
+Identity is authored by the companion. Dedicated constraints changes require approval of an exact proposal; user memory-management operations are not exposed as agent approval tools. Preserve these distinctions when adding features.
 
-These matter more than performance, and review will hold you to them:
+## Development
 
-1. **Single writer.** Any path that writes memory must go through the kernel. The shell, the scripts,
-   and the extension must never write the journal or its projections directly.
-2. **Memory is never destroyed.** The journal is append-only and the projections (`diary/`,
-   `mailbox.md`, `stream.jsonl`, `voice/`) are outputs, not cache: never delete them, never replace
-   them with a summary. The only evictable layer is the working view (`context/`), and eviction means
-   "out of view", not "gone" — see ARCHITECTURE.md → "Memory: truth, projections, and what
-   'compression' may do".
-3. **No personal data in the repo.** This project ships no preset personality and no sample
-   character. A commit must never contain a real instance's identity, real memory content, an API
-   key, or an absolute home-directory path.
-
-## Development setup
+Requirements: macOS 14+, Swift 6/Xcode command line tools, Node 24 LTS (or 22.18+ on the 22.x line), and pi 0.70.2.
 
 ```bash
-git clone https://github.com/ACGpp/Sprite.git
-cd Sprite
-npm ci                 # dev-only deps (TypeScript, for typechecking); the kernel itself has zero deps
-./install.sh --dev     # build + install the app; the kernel runs straight from this checkout
+npm install -g @mariozechner/pi-coding-agent@0.70.2
+npm ci
+npm run core:typecheck
+npm run policy:typecheck
+npm run pi:typecheck
+npm run typecheck
+npm run core:test
+npm run release:test
+npm run shell:test
+npm run app:build
 ```
 
-Requirements: macOS 14+, Node 22+, Xcode command line tools, and
-[pi](https://github.com/badlogic/pi-mono) (`npm install -g @mariozechner/pi-coding-agent`).
+`pi:typecheck` checks against the installed engine's real API. Kernel tests use isolated homes and offline providers; some require the real pi binary. Report skips separately. `Scripts/verify-all.sh` also exercises live, voice, reconnect, soak and scale paths: inspect each stage's output rather than treating a final summary as evidence for every check.
 
-With `--dev` the kernel runs `core/main.ts` from this checkout, so after changing kernel code:
+Use `./install.sh --dev` when you want the installed service to run this checkout. This changes your local installation and uses your real memory. After kernel edits, restart with `launchctl kickstart -k gui/$(id -u)/com.sprite.core`; rebuild shell changes with the installer. Normal `./install.sh` copies the kernel into Application Support. Uninstall preserves memory.
+
+Match the existing architecture and add regression coverage for behavioral fixes. Report what failed before, what passes now, and what remains unverified. UI strings use `L(...)`/`Lf(...)` in `Localization.swift`; original diary and conversation content is not translated. Keep both READMEs and changelogs aligned.
+
+## Preparing a public update
+
+The author's local development history contains private notes. **Do not push that development branch directly.** Public snapshots retain only the publishable tree and have the current public branch as their parent. The publication script excludes `docs/`, old prototypes and build output; root documentation is public.
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.sprite.core   # restart the kernel
-tail -f ~/Library/Logs/sprite-core.log                # watch it come up
+# Committed source is the default. To include pending tracked and new files:
+Scripts/publish-code.sh --source worktree --branch publish/code-only
+# Inspect and validate the resulting local commit before any push:
+git diff origin/main..publish/code-only --stat
+# After review, publish that exact snapshot (not newer working-tree changes):
+Scripts/publish-code.sh --source publish/code-only --push
 ```
 
-Shell changes need a rebuild: `./install.sh --dev` again. The app is ad-hoc signed, so macOS may ask
-for microphone permission again afterwards — expected, not a bug.
+Without `--push`, the script only creates a local candidate and runs the privacy scan. It never changes the working tree or the normal index. Updates use normal fast-forward pushes, without rewriting remote history. If the remote changes after review, review the rebuilt candidate before publishing.
 
-Other flags: `./install.sh --no-service` (skip the launchd service), `./install.sh --uninstall`
-(removes app + service, **keeps your memory**).
-
-## Tests
+The privacy scanner compares a Git tree against local real-memory probes. It is a useful gate, not proof that arbitrary secrets or private history are absent. Without local memory it cannot perform those comparisons. Inspect the diff as well. A local pre-push hook is supplied in `Scripts/hooks/pre-push`; Git does not install hooks on clone. Its current checks target the configured public Sprite remote and the pushed tips, not every historical commit.
 
 ```bash
-node --test "core/**/*.test.ts"   # kernel: journal, importer, projections, RPC, scheduler, breath,
-                                  # gateway policy, settings, scale, end-to-end
-cd shell && swift test            # shell: RPC contract + pure logic (conversation merge, settings,
-                                  # speaking-card policy)
-Scripts/verify-all.sh             # the full acceptance run (10 stages, ~3 minutes)
+python3 Scripts/privacy-scan.py . publish/code-only
 ```
 
-`Scripts/verify-all.sh` is the source of truth: typecheck, kernel tests, Swift contract tests, a
-zero-warnings Swift concurrency check, self-checks, a live kernel + real `pi` round trip, the voice
-path, reconnect, a soak run, and a 200k-event scale measurement. **Do not quote numbers from these
-docs — quote what the script prints.** Some stages skip honestly when the environment cannot support
-them (no microphone, no speech recogniser, no `pi` binary); a skip is never reported as a pass.
+Redact private hits. Add a narrowly documented allowlist entry only for confirmed product wording. Never resolve a hit by disabling the check. Keep scanner logs private because they may quote matching text.
 
-## How changes get accepted
+## macOS releases
 
-- **Reproduce first, then fix.** Nearly every real bug in this codebase was found by a test rather
-  than by reasoning — including races that only appeared under load. Add a regression test that fails
-  before your fix and passes after it, and say in the PR what the failing state looked like.
-- **Honest degradation over silent failure.** When something cannot work, the product says so (a
-  `system.problem` event, a visible note in the UI, a skipped test) instead of pretending.
-- **Durable facts come from the journal files, not from caches.** The in-memory read model is a
-  bounded window; anything promised to the user ("it will hand these back in the morning") must be
-  read from disk.
-- Commit messages: Chinese or English, both fine. Explain *why* the change is needed; the *what* is
-  in the diff.
-- **Code comments are currently Chinese**, and so is `install.sh` output. The app itself now has an
-  English UI: all user-facing strings go through `L(...)`/`Lf(...)` in
-  `shell/Sources/sprite-shell/Localization.swift`, where the **Chinese original is the dictionary
-  key** and anything untranslated falls back to it — so translating is incremental and never leaves a
-  blank. To add a language, copy the dictionary and extend `UILanguage`. Write your own comments in
-  whichever language you are comfortable with; translating existing ones is welcome but not required.
+CI checks types, kernel/installer/publication tests and Swift tests with pinned pi. A `v*` tag triggers `.github/workflows/release-macos.yml`. Apple Silicon and Intel runners each build and smoke-test a self-contained app; only after both succeed is a **draft** GitHub Release created with DMG, ZIP and checksum assets. Tag only a reviewed public snapshot after CI passes. Review the draft before publishing it.
 
-## Before you push
+Use `npm run package:macos` to build for your current Mac's architecture. The runtime has its own locked dependencies under `Scripts/runtime/`; update that lock deliberately when changing pi. Packaging includes licenses and excludes user data and test fixtures. First launch uses `Scripts/bootstrap-runtime.mjs` to prepare the per-user service; tests must use isolated homes and mocked launchctl, never the developer's live service. See [INSTALL.md](INSTALL.md) for the complete flow and signing limits.
 
-A privacy gate runs as a local `pre-push` hook (source: `Scripts/hooks/pre-push`). It scans what you
-are about to publish against **your own real memory** and refuses the push if it finds an identity, a
-verbatim memory fragment, an API key, or an absolute home path:
+## Reports and license
 
-```bash
-python3 Scripts/privacy-scan.py . HEAD   # exactly what the hook runs
-```
-
-If it flags something, either redact it, or — only when you are certain it is product wording rather
-than private content — add the phrase to `Scripts/privacy-allowlist.txt` with a comment saying why.
-
-Two more local guards worth knowing: `core/settings.test.ts` fails if any tracked file hardcodes an
-absolute home directory, and the same file fails if build artifacts are tracked (`shell/.build*`,
-`.core-test/`, `.demo/`).
-
-## Releases
-
-`origin/main` is a **code-only snapshot**: the author publishes it with
-`Scripts/publish-code.sh --push`, which builds a single commit containing the code and never the
-author's development notes. That is why the public history looks compressed — it is intentional, not
-lost history. If a design decision is not written down publicly, just ask.
-
-## If the app hangs
-
-The shell is SwiftUI inside AppKit windows, so a hang is almost always a **layout loop** rather than
-blocked I/O. Two commands pin it down in under a minute:
-
-```bash
-pgrep -x Sprite                      # the app's pid
-sample "$(pgrep -x Sprite)" 3 -file /tmp/sprite-sample.txt
-log show --predicate 'process == "Sprite"' --last 10m --style compact \
-  | grep -iE "layout|state during|SwiftUI"
-```
-
-What to look for: every sample sitting in `NSHostingView.layout()` means the window keeps re-laying
-out, and AppKit will say so explicitly — `-layoutSubtreeIfNeeded ... has continued for 300 iterations
-because -updateConstraints and/or -layout has kept the layout dirty`. The usual cause is feedback
-between a window and its content: an `NSHostingController` whose content size the window chases while
-the content re-measures to fit the window. The records window disables that feedback
-(`controller.sizingOptions = []`, see `AppDelegate.openRecords`), and layout-sensitive additions
-should keep a stable size (`lineLimit`, `frame(maxWidth:)`, `fixedSize`) instead of leaving a `Spacer`
-to renegotiate width on every pass.
-
-## Where to ask
-
-Open an issue with what you tried, what you expected, and the raw evidence (the relevant
-`~/.claude-memory/journal/YYYY-MM-DD.jsonl` slice, a screenshot, or the `verify-all` output).
-Never paste your API key or your real conversations.
-
-## License
-
-See [LICENSE](LICENSE).
+Report reproduction steps, expected and actual behavior, and redacted evidence. Do not paste raw personal journal entries or keys. See [LICENSE](LICENSE).

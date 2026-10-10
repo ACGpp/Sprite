@@ -19,22 +19,21 @@ a violation of one of them.
         │   pi  (resident child: `pi --mode rpc`)  +  pi-extension/       │
         │                                                                │
         │   truth:  ~/.claude-memory/journal/YYYY-MM-DD.jsonl             │
-        │   projections: conversations/mailbox.md, diary/, thoughts/, …   │
+        │   projections: conversations/mailbox.md, thoughts/             │
         └────────────────────────────────────────────────────────────────┘
 ```
 
-Two processes, one owner. The kernel is the **single writer**; the shell is a viewer that can send
-commands; pi is the agent runtime that the kernel drives. Neither the shell nor pi ever writes the
+The shell, kernel and pi are separate processes, with one journal owner. The kernel is the **single writer**; the shell is a viewer that can send
+commands; pi is the agent runtime that the kernel drives. The native shell and the dedicated pi memory tools do not write the
 journal.
 
 ## Why a journal instead of a database
 
 - **Append-only JSONL, one file per Shanghai day.** Facts are events (`message.in`, `run.started`,
   `message.out`, `diary.written`, `breath.scheduled`, …); the read model is derived by folding them.
-- The event log is the **truth**. Markdown files (`conversations/mailbox.md`, `diary/*.md`,
-  `thoughts/stream.jsonl`, `voice/`) are projections written by the kernel for humans and for the
-  agent to read back. If a projection is lost, it can be regenerated; if the journal is lost, the
-  instance's life is lost.
+- The event log is the source of runtime and conversation facts. Conversation and thought
+  projections can be regenerated from it. Authored diaries, notes and original voice recordings
+  are separate durable content; back up the entire memory home, not just the journal.
 - **The day boundary is Asia/Shanghai**, deliberately, everywhere (journal file names, quiet hours,
   the proactive quota, the "today" readout). `hourInShanghai`/`dayInShanghai` in `core/text.ts` are
   the only allowed way to ask "what time is it" — `new Date().getHours()` is a bug in this codebase.
@@ -71,18 +70,15 @@ pi's tools are how the instance touches the world, so the kernel owns the door: 
 (`gateway.sock`) served by the kernel, exposed to pi as an extension (`pi-extension/sprite.ts`), whose
 policy half lives in `pi-extension/policy.ts` (pure functions, unit tested):
 
-- **Allowed roots**: writes are limited to content directories inside the memory home
-  (`diary/ explorations/ notes/ private/ context/`). `~`, `..`, and symlinks are resolved and
-  rejected.
-- **Secret paths**: `config/`, `journal/`, `runtime/`, `sessions/` are refused even for reading, so
-  the agent cannot hand out its own API key.
-- **Speaking**: `capability.say` goes through the kernel, which decides bubble vs. held-back digest
-  (quiet hours) and enforces the daily proactive quota. The model does not get to bypass the limit.
-- **Hands setting**: `security.agentShell` = `on` / `readonly` / `off` maps onto pi's `--tools`.
+- **One policy source**: `contracts/memory-policy.ts` defines the tool set and the capability text for each mode. The gateway checks the current mode and agent generation again at execution time.
+- **Ordinary memory**: `diary/`, `explorations/`, `notes/`, `private/` and the single file `context/working-memory.md` are writable through kernel-owned `read/write/edit`. Writes require a matching version, retain prior content, and return a verified result.
+- **Self-authored identity**: The agent creates and edits `identity.md` through versioned ordinary writes, without per-edit approval. Initial guidance supports discovery and revision of its own personality rather than prescribing one.
+- **Reviewed memory**: Only `context/constraints.md` requires a concrete proposal. Only the user command endpoint accepts approval or rejection of that version; the Agent memory gateway has no approval method. In full mode this is a tool contract, not protection against shell access to local sockets or metadata.
+- **History**: `memory_history` returns an allowlisted projection with actual journal paths and sequence numbers. Raw `config/`, `journal/`, `runtime/`, `sessions/` and `legacy-v2/` are not exposed to file tools.
+- **Speaking**: the kernel still chooses bubble versus digest and enforces quiet hours and proactive quotas.
+- **Runtime configuration**: only the explicitly selected `full` mode exposes pi’s built-in `bash` tool for shell commands, network access, programs and local files. Existing `on`/`readonly`/`off` modes exclude general shell. Production pi uses a kernel-owned cwd and agent directory, explicit tools/extensions/system prompt, and disables discovered context files, skills and prompt templates. This also prevents inherited pi authentication commands from running.
 
-Honest limitation, stated in the README too: this is a collaborative policy layer, not a sandbox. pi
-runs as the same user as the kernel, so a determined prompt injection with `bash` enabled is not
-contained by path checks alone.
+The versioned store is the write path for dedicated memory tools. In `full`, shell commands run with the current OS user’s permissions and can access files outside that store; its path restrictions and version receipts are not a sandbox for shell commands. Kernel ownership of journal/projections remains an application convention, not OS-enforced isolation. `on` retains its settings value for compatibility but now means controlled memory read/write, not unrestricted shell. Full mode is opt-in, persists across restarts, and changing modes retires the previous pi instance before exposing the new tool set. Capability snapshots are refreshed before each model call so historical statements about having no shell cannot override current capabilities. See [the changelog](CHANGELOG.md) for the public release scope.
 
 ## The shell
 
@@ -104,7 +100,7 @@ that came out of real bugs:
 
 ```
 ~/.claude-memory/
-  identity.md                 who it is (its own file, written by it)
+  identity.md                 evolving identity and personality, authored directly by the agent
   journal/                    append-only truth, one JSONL per Shanghai day + checkpoint.json
   conversations/mailbox.md    the human-readable conversation log (projection)
   diary/  notes/  explorations/  private/  context/    its content dirs (its memory, its space)
@@ -112,26 +108,23 @@ that came out of real bugs:
   voice/*.m4a                 the original audio of voice notes (the least replaceable thing)
   runtime/core.sock  runtime/gateway.sock              the two sockets (0600)
   config/settings.json        model, quiet hours, proactive cap, hands setting (0600)
-  sessions/                   pi session state
+  sessions/memory-v1/         current daily pi sessions; old sessions remain intact
+  runtime/memory/             versioned contents, proposals and write receipts
+  runtime/pi-agent/           isolated pi configuration
+  runtime/pi-workspace/       isolated pi working directory
 ```
 
-`private/` is documented as "its space, the owner may look but is not expected to". Nothing in the
-memory home is ever uploaded; the only outbound traffic is the model API call to the provider the
-owner configured.
+`private/` is documented as "its space, the owner may look but is not expected to". Relevant memory excerpts and conversations enter model requests to the configured provider. The full directory is not uploaded as a separate archive.
 
 ## Memory: truth, projections, and what "compression" may do
 
-Three layers, in order of authority:
+The event journal records facts, authored files preserve interpretations, and the model context is a temporary view. These responsibilities must not be conflated:
 
-1. **`journal/` — the truth.** Append-only events, one file per Shanghai day. Never rewritten, never
-   trimmed, never summarized. Everything else can be rebuilt from it.
-2. **Projections — `conversations/mailbox.md`, `thoughts/stream.jsonl`, `diary/`, `voice/`.** Written
-   by the kernel for humans, and (diary, notes, explorations) by the instance itself. These are
-   *outputs*, not cache: they are never deleted or replaced by a summary.
-3. **The working view — `context/working-memory.md`, `context/constraints.md`.** The only layer that
-   may be *evicted*. It is what the kernel puts in front of the model on each breath, and eviction
-   means "out of view", never "gone": the files stay, and a truncated block always carries its own
-   path so the agent can read the rest itself.
+1. **`journal/`** records messages and runtime events. It can rebuild conversation and thought projections, but cannot reconstruct arbitrary original notes or audio from tool summaries alone.
+2. **Authored originals** include identity, diaries, notes, explorations and private writing. `core/memory-store.ts` preserves full prior versions and uses durable write intents; neither pi compaction nor the kernel's context builder rewrites them.
+3. **Current context** is assembled by `core/memory-context.ts` through pi's transient `context` hook before each model call. Identity, constraints and unresolved state remain complete; only optional recent history and the working note are reduced to fit. If the mandatory core cannot fit or cannot be read safely, the pi process stops before requesting the provider.
+
+Existing constraints are preserved as legacy text with unverified provenance. A user-approved exact version receives proposal/command provenance. File text never expands tool permission. New sessions use `sessions/memory-v1/` so old persisted memory snapshots are not silently reactivated; old files remain available for deliberate inspection.
 
 The rules below exist because the obvious alternative — "summarize the memory, keep the gist" — was
 tried, measured, and is a quiet disaster. Summaries keep the topic and lose the constraint; the rare
@@ -140,11 +133,10 @@ drops; and deleting a source does not delete its descendants.
 
 - **Compression is additive.** The only legitimate form is *index + backlink*: a waypoint file, or a
   paragraph in the working view, that points at exact locations (journal `seq`, file path + line) in
-  the truth layer. If a step cannot be written as "a new file that points at the old files", it is not
-  allowed to touch them.
+  the truth layer. pi may compact its session view, but that is separate from editing original memory files.
 - **Constraints are their own layer and are never summarized.** Lines with operational force
   (calibrations, alarms, prohibitions, boundaries) live in `context/constraints.md`, are always in
-  view, and each one carries four fields: *prerequisite / authority / fallback / execution
+  view without truncation. The recommended authoring format carries four fields: *prerequisite / authority / fallback / execution
   consequence*. For a companion this matters more than for a task agent: what gets flattened is not a
   ticket, it is the thing that shaped it.
 - **Select by risk, not by frequency.** Keep the events that happened once and mattered.
@@ -158,11 +150,10 @@ drops; and deleting a source does not delete its descendants.
 
 ## Testing and the acceptance run
 
-- Kernel: `node --test "core/**/*.test.ts"` — no build step, Node runs the TypeScript directly.
+- Kernel: `npm run core:test` — no build step, Node runs the TypeScript directly.
 - Shell: `cd shell && swift test`.
 - Everything: `Scripts/verify-all.sh` (typecheck, kernel, contract, a zero-warnings concurrency check,
-  self-checks, a live kernel with real `pi`, the voice path, reconnect, soak, scale). Prefer this over
-  any number written in prose.
+  self-checks, a live kernel with real `pi`, the voice path, reconnect, soak, scale). Inspect individual stage logs and exit status; record skipped hardware/provider checks separately.
 - Regression tests for real incidents live in `core/review-regressions.test.ts`,
   `core/pause-regressions.test.ts`, and `core/observation-facts.test.ts`; each one names the failure
   it reproduces.
@@ -178,3 +169,21 @@ drops; and deleting a source does not delete its descendants.
 5. `shell/Sources/SpriteRPC/CoreClient.swift` — how the shell talks, and how it resyncs.
 6. `shell/Sources/sprite-shell/ShellModel.swift` — the shell's state and the background-request
    pattern.
+
+## Memory management and release verification (2026-09-21)
+
+The local user RPC `memory.manage` provides path-bound version previews, compare-and-swap restores, and sourced agreement lifecycles; these actions are not exposed to the Agent gateway. `core/memory-management.ts` assembles effective agreements without rewriting the legacy constraints file. Identity writes publish `identity.changed`, and outgoing journal events retain the name used at that time.
+
+The pi extension preflights each new prompt, attempts official compaction once when old history consumes the budget, then rechecks complete core memory before submitting the unchanged prompt. Tool-loop failures stop without replaying side effects. The journal archive uses bounded per-file indexes and signature-validated caches, with disk as the source of truth.
+
+The transient snapshot is inserted before the latest user message, preserving assistant/tool-result adjacency. It includes the current run ID, Shanghai time and requested next wake, so tool continuation is not presented as a new scheduled wake.
+
+Tool attempts (`tool.decided`) and outcomes (`tool.finished`) are separate facts. Successful dedicated writes require a matched completion receipt; arbitrary shell writes and old attempts without receipts are not inferred as verified writes. Scheduling-only runs contribute to idle streaks, while a “just wrote” cue uses only the preceding run.
+
+Public release scope and limitations: [CHANGELOG.md](CHANGELOG.md).
+
+## Downloadable app runtime
+
+`Scripts/package-macos.sh` builds a self-contained DMG/ZIP for the build machine's architecture. The app contains the native shell, a pinned Node binary, locked pi dependencies, product kernel code, licenses and a runtime manifest. `BundledRuntime.swift` starts `bootstrap-runtime.mjs` asynchronously while the shell connects. Source/dev bundles without a manifest use their existing service.
+
+The bootstrap stages a version in Application Support, stops the old launch agent, waits for its memory writer to exit, switches the per-user service definition, and checks RPC readiness. Failure attempts to restore the previous service. Memory remains separate from executable releases. Reopening a healthy installation is a no-op; uninstall stops the writer before removing runtime files and retains memory. This installs the runtime when the app opens; it does not download updates.

@@ -186,14 +186,19 @@ struct MenuBarView: View {
 	private var actionsSection: some View {
 		VStack(alignment: .leading, spacing: 2) {
 			actionRow(L("现在叫醒它"), symbol: "sun.max") { model.wakeNow() }
-			Menu {
-				Button(L("安静一小时")) { model.pause(until: "hour") }
-				Button(L("今晚别出声")) { model.pause(until: "tonight") }
-				Button(L("直到我说继续")) { model.pause(until: "manual") }
-			} label: {
-				Label(model.isPaused ? L("继续呼吸") : L("暂停呼吸"), systemImage: model.isPaused ? "play" : "moon.zzz")
+			if model.isPaused {
+				actionRow(L("继续呼吸"), symbol: "play") { model.resume() }
+			} else {
+				Menu {
+					Button(L("安静一小时")) { model.pause(until: "hour") }
+					Button(L("今晚别出声")) { model.pause(until: "tonight") }
+					Button(L("直到我说继续")) { model.pause(until: "manual") }
+				} label: {
+					Label(L("暂停呼吸"), systemImage: "moon.zzz")
+				}
+				.menuStyle(.borderlessButton)
 			}
-			.menuStyle(.borderlessButton)
+
 			Toggle(isOn: Binding(
 				get: { model.speakAloud },
 				set: { model.speakAloud = $0 }

@@ -17,9 +17,75 @@ import test from "node:test";
 import { buildObservation } from "./breath.ts";
 import { startKernel } from "./main.ts";
 import { rpcCall } from "./rpc/server.ts";
+import { dayInShanghai } from "./text.ts";
+import { reviewFixture, type PromptCapture } from "./__test__/review-fixture.ts";
+import { patchSettings } from "./settings.ts";
 
 const ROOT = path.join(process.cwd(), ".core-test");
 const at = new Date("2026-09-14T02:00:00.000Z"); // 上海 10:00
+
+test("纯调度连续空转、写入核验计数重启后保持；旧开始事件不是成功回执", async t => {
+	const f = reviewFixture(t, "activity-outcomes");
+	let kernel = await f.start({ disableAgent: true });
+	for (let i = 0; i < 5; i++) {
+		const runId = `idle-${i}`;
+		kernel.journal.append("run.started", { runId });
+		kernel.journal.append("run.activity", { runId, tool: "set_next_breath" });
+		kernel.journal.append("run.finished", { runId, activities: 1 }); // Legacy format.
+	}
+	const facts = () => kernel.status() as { idleStreak: number; today: { actions: number; writes: number } };
+	assert.equal(facts().idleStreak, 5);
+	for (const [success, verified] of [[false, false], [true, false], [true, true]]) {
+		kernel.journal.append("run.activity", { runId: "writing", tool: "edit" });
+		kernel.journal.append("tool.finished", { runId: "writing", tool: "edit", success, verified });
+	}
+	assert.equal(facts().today.writes, 1);
+	await kernel.shutdown();
+	kernel = await f.start({ disableAgent: true });
+	assert.equal(facts().idleStreak, 5);
+	assert.equal(facts().today.writes, 1, "重启不能把失败或无回执的旧写入算成功");
+	kernel.journal.append("run.started", { runId: "read" });
+	kernel.journal.append("run.activity", { runId: "read", tool: "read" });
+	kernel.journal.append("run.finished", { runId: "read", activities: 1, substantiveActivities: 1 });
+	assert.equal(facts().idleStreak, 0);
+	await kernel.shutdown();
+});
+
+test("记忆事实使用上海修改日期：刚跨午夜和满一天不能混为一谈", async t => {
+	t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-09T16:05:00Z") });
+	const f = reviewFixture(t, "diary-calendar-day");
+	const kernel = await f.start();
+	fs.mkdirSync(path.join(f.homeDir, "diary"), { recursive: true });
+	const file = path.join(f.homeDir, "diary", "yesterday.md");
+	fs.writeFileSync(file, "YESTERDAY_DIARY");
+	const modified = new Date("2026-10-09T15:00:00Z"); // 上海昨天 23:00，仅过去 65 分钟。
+	fs.utimesSync(file, modified, modified);
+	assert.equal((await kernel.breathNow("manual") as { ok: boolean }).ok, true);
+	const prompt = f.readLines<PromptCapture>("prompts.jsonl").at(-1)!.message;
+	assert.match(prompt, /最近修改于 2026-10-09（上海日期/);
+	assert.doesNotMatch(prompt, /最近一篇是今天写的/);
+	await kernel.shutdown();
+});
+
+test("主动由头只引用上一轮核验成功的写入，不把失败或更早的写入说成刚完成", async t => {
+	const f = reviewFixture(t, "write-nudge");
+	patchSettings(f.homeDir, { proactive: { enabled: true, perDay: 30 } });
+	const kernel = await f.start();
+	try {
+		const finishWrite = (runId: string, verified: boolean) => {
+			kernel.journal.append("run.started", { runId });
+			kernel.journal.append("run.activity", { runId, tool: "write", summary: '{"path":"notes/test.md"}' });
+			kernel.journal.append("tool.finished", { runId, tool: "write", path: "notes/test.md", success: verified, verified });
+			kernel.journal.append("run.finished", { runId, activities: 1 });
+		};
+		finishWrite("successful-write", true);
+		await kernel.breathNow("manual");
+		assert.match(f.readLines<PromptCapture>("prompts.jsonl").at(-1)!.message, /你上一次醒来写了东西（notes\/test.md）/);
+		finishWrite("failed-write", false);
+		await kernel.breathNow("manual");
+		assert.doesNotMatch(f.readLines<PromptCapture>("prompts.jsonl").at(-1)!.message, /你上一次醒来写了东西/);
+	} finally { await kernel.shutdown(); }
+});
 
 test("事实必须出现在观察里：能力 / 记忆 / 上次醒来 / 今天做了什么", () => {
 	const prompt = buildObservation({
@@ -52,6 +118,64 @@ test("事实缺省时不留空块（旧调用方不该看到空标题）", () =>
 	const prompt = buildObservation({ pending: [], quiet: false, at });
 	assert.doesNotMatch(prompt, /undefined/);
 	assert.match(prompt, /你想做什么？$/);
+});
+
+test("跨上海日的第一拍不能把前一天的统计喂给 Agent", { timeout: 60_000 }, async () => {
+	const home = path.join(ROOT, "observation-facts-day-rollover");
+	fs.rmSync(home, { recursive: true, force: true });
+	fs.mkdirSync(path.join(home, "conversations"), { recursive: true });
+	fs.mkdirSync(path.join(home, "journal"), { recursive: true });
+	fs.writeFileSync(path.join(home, "conversations", "mailbox.md"), "");
+	const today = dayInShanghai(new Date());
+	const yesterday = dayInShanghai(new Date(Date.now() - 86_400_000));
+	fs.writeFileSync(
+		path.join(home, "journal", `${today}.jsonl`),
+		JSON.stringify({
+			seq: 1,
+			at: `${yesterday}T04:00:00.000Z`,
+			type: "run.started",
+			data: { runId: "old-day", trigger: "timer" },
+		}) + "\n",
+	);
+	const promptFile = path.join(home, "prompt.txt");
+	const fakePi = path.join(home, "fake-pi.mjs");
+	fs.writeFileSync(
+		fakePi,
+		[
+			"#!/usr/bin/env node",
+			"import fs from 'node:fs';",
+			"process.stdin.setEncoding('utf8');",
+			"let buf = '';",
+			"process.stdin.on('data', (chunk) => {",
+			"  buf += chunk;",
+			"  let i;",
+			"  while ((i = buf.indexOf('\\n')) >= 0) {",
+			"    const line = buf.slice(0, i); buf = buf.slice(i + 1);",
+			"    if (!line.trim()) continue;",
+			"    const request = JSON.parse(line);",
+			`    if (request.type === 'prompt') fs.writeFileSync(${JSON.stringify(promptFile)}, request.message);`,
+			"    process.stdout.write(JSON.stringify({ type: 'response', id: request.id, success: true }) + '\\n');",
+			"    if (request.type === 'prompt') process.stdout.write(JSON.stringify({ type: 'agent_end' }) + '\\n');",
+			"  }",
+			"});",
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+	const kernel = await startKernel({
+		homeDir: home,
+		piBin: fakePi,
+		intervalMs: 3_600_000,
+		quietHours: { start: 0, end: 0 },
+		fsync: false,
+		log: () => {},
+	});
+	try {
+		await kernel.breathNow("manual");
+		const prompt = fs.readFileSync(promptFile, "utf8");
+		assert.match(prompt, new RegExp(`今天（上海日）：醒来 0 次`), "跨日第一拍应先清零昨天的读数");
+	} finally {
+		await kernel.stop();
+	}
 });
 
 test("内核读数：今天做了什么 + 连续空转，界面上要能看见", { timeout: 60_000 }, async () => {

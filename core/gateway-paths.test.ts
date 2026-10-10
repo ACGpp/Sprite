@@ -102,3 +102,15 @@ test("可写根收窄：config / journal / runtime / sessions 都不在允许写
 	// 收窄之后目录可能还不存在：最近存在祖先的 realpath 逻辑要能处理
 	assert.equal(narrowed("diary/子目录/新的.md", ROOT), true, "允许目录下的新子目录也要能写");
 });
+
+test("identity 仅允许精确文件，符号链接不能把文件白名单变成外部权限", async () => {
+	const identity = path.join(ROOT, "identity.md");
+	process.env.SPRITE_ALLOWED_ROOTS = identity;
+	const { inAllowedRoot: identityOnly } = await import(`../pi-extension/policy.ts?identity=${Date.now()}`);
+	assert.equal(identityOnly(identity, ROOT), true);
+	assert.equal(identityOnly(path.join(identity, "nested"), ROOT), false);
+	fs.symlinkSync(path.join(OUTSIDE, "identity.md"), identity);
+	assert.equal(identityOnly(identity, ROOT), false, "即使目标尚不存在也不能经 symlink 写出家门");
+	fs.writeFileSync(path.join(OUTSIDE, "identity.md"), "EXTERNAL");
+	assert.equal(identityOnly(identity, ROOT), false);
+});

@@ -23,7 +23,7 @@ public struct KernelSettings: Sendable, Equatable {
 	public var quietEnd = 7
 	public var proactiveEnabled = true
 	public var proactivePerDay = 2
-	/// agent 的手脚档位：on / readonly / off（见 core/settings.ts）
+	/// agent 的手脚档位：full（Shell、联网、本地文件）/ on（受控记忆）/ readonly / off（见 core/settings.ts）
 	public var agentShell = "on"
 	public var source = "default"
 	public var piAvailable = false

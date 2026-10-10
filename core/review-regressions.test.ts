@@ -463,6 +463,7 @@ test("M7 内核胶水：安静时段收下的 digest，在安静结束后的第�
 		fakePi,
 		[
 			"#!/usr/bin/env node",
+			"import fs from 'node:fs'; fs.writeFileSync(process.env.SPRITE_MEMORY_HOME + '/generation.txt', process.env.SPRITE_AGENT_GENERATION || '');",
 			"process.stdin.setEncoding('utf8');",
 			"let buf = '';",
 			"process.stdin.on('data', (chunk) => {",
@@ -513,7 +514,8 @@ test("M7 内核胶水：安静时段收下的 digest，在安静结束后的第�
 
 		// 安静时段里它想说一句 → 内核收成 digest
 		const gateway = path.join(home, "runtime", "gateway.sock");
-		const said = (await call(gateway, { kind: "capability.say", text: "夜里收着的一句" })) as { delivered?: string };
+		for (let i = 0; i < 250 && !fs.existsSync(path.join(home, "generation.txt")); i++) await new Promise(resolve => setTimeout(resolve, 20));
+		const said = (await call(gateway, { kind: "capability.say", generation: fs.readFileSync(path.join(home, "generation.txt"), "utf8"), text: "夜里收着的一句" })) as { delivered?: string };
 		assert.equal(said.delivered, "digest", "安静时段应该收成 digest");
 
 		// 安静结束（改设置）+ 显式叫醒 → 这一拍必须把收着的话交回去
@@ -553,6 +555,7 @@ test("M7 竞态：唤醒在安静那一拍飞行途中被拒，收着的话照�
 		fakePi,
 		[
 			"#!/usr/bin/env node",
+			"import fs from 'node:fs'; fs.writeFileSync(process.env.SPRITE_MEMORY_HOME + '/generation.txt', process.env.SPRITE_AGENT_GENERATION || '');",
 			"process.stdin.setEncoding('utf8');",
 			"let buf = '';",
 			"process.stdin.on('data', (chunk) => {",
@@ -605,7 +608,8 @@ test("M7 竞态：唤醒在安静那一拍飞行途中被拒，收着的话照�
 
 		// 它想说的话 → 内核收成 digest（安静时段）
 		const gateway = path.join(home, "runtime", "gateway.sock");
-		const said = (await call(gateway, { kind: "capability.say", text: "被唤醒撞掉的那一句" })) as { delivered?: string };
+		for (let i = 0; i < 250 && !fs.existsSync(path.join(home, "generation.txt")); i++) await new Promise(resolve => setTimeout(resolve, 20));
+		const said = (await call(gateway, { kind: "capability.say", generation: fs.readFileSync(path.join(home, "generation.txt"), "utf8"), text: "被唤醒撞掉的那一句" })) as { delivered?: string };
 		assert.equal(said.delivered, "digest", "安静时段应该收成 digest");
 
 		// 那一拍还在飞：翻转安静时段 + 叫醒 → 这次唤醒必然被 busy 拒
@@ -627,7 +631,7 @@ test("M7 竞态：唤醒在安静那一拍飞行途中被拒，收着的话照�
 			1,
 			`被拒的唤醒不得吃掉夜里收着的那句话（实际 ${handedBack.length} 拍交回；所有拍 heldBack = ${JSON.stringify(runs.map((d) => d.heldBack))}）`,
 		);
-		assert.equal(handedBack[0]!.trigger, "recovered-queue", "应当由那一拍结束后的补跑交回");
+		assert.equal(handedBack[0]!.trigger, "wake", "补跑必须保留显式唤醒意图，同时交回夜间留言");
 		assert.match(String(handedBack[0]!.nudge ?? ""), /安静时段刚结束/);
 	} finally {
 		await kernel.stop();

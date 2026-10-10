@@ -58,6 +58,14 @@ final class SettingsAndConversationTests: XCTestCase {
 		}
 	}
 
+	func testDecodesEveryAgentCapabilityMode() throws {
+		for mode in ["full", "on", "readonly", "off"] {
+			let payload = "{\"security\":{\"agentShell\":\"\(mode)\"}}"
+			let value = try JSONDecoder().decode(JSONValue.self, from: Data(payload.utf8))
+			XCTAssertEqual(KernelSettings.decode(value).agentShell, mode)
+		}
+	}
+
 	func testIgnoresUnknownFieldsAndBadEntries() throws {
 		// 未来内核加的字段不该影响解码；坏条目直接跳过而不是整份失败
 		let payload = """
@@ -127,7 +135,23 @@ final class SettingsAndConversationTests: XCTestCase {
 			outgoing: [outgoing("旧的回复", seq: 2, imported: true), outgoing("刚回复的", seq: 9)]
 		)
 		XCTAssertEqual(turns.count, 4, "完整对话流里旧历史还在（归档要用）")
-		XCTAssertEqual(Conversation.live(turns).map(\.text), ["今天的", "刚回复的"])
+		let now = ISO8601DateFormatter().date(from: "2026-09-12T01:00:00Z")!
+		XCTAssertEqual(Conversation.live(turns, now: now).map(\.text), ["今天的", "刚回复的"])
+	}
+
+	func testLiveConversationChangesAtShanghaiMidnightAndKeepsPendingMessages() {
+		let turns = Conversation.merge(messages: [
+			IncomingMessage(text: "昨天", source: "text", seq: 1, at: "2026-09-17T15:59:59.999Z"),
+			IncomingMessage(text: "今天零点", source: "text", seq: 2, at: "2026-09-17T16:00:00Z"),
+			IncomingMessage(text: "今天上午", source: "text", seq: 3, at: "2026-09-18T10:00:00+08:00"),
+			IncomingMessage(text: "坏时间", source: "text", seq: 4, at: "invalid"),
+			IncomingMessage(text: "明天", source: "text", seq: 5, at: "2026-09-18T16:00:00Z"),
+		], outgoing: [], optimistic: ["发送中"])
+		let parser = ISO8601DateFormatter()
+		XCTAssertEqual(Conversation.live(turns, now: parser.date(from: "2026-09-17T15:59:59Z")!).map(\.text), ["昨天", "发送中"])
+		XCTAssertEqual(Conversation.live(turns, now: parser.date(from: "2026-09-17T16:00:00Z")!).map(\.text), ["今天零点", "今天上午", "发送中"])
+		XCTAssertEqual(Conversation.live(turns, now: parser.date(from: "2026-09-19T16:00:00Z")!).map(\.text), ["发送中"])
+		XCTAssertEqual(turns.count, 6, "日切只影响显示，不删除历史")
 	}
 
 	func testKernelStateDecodesTodayActivityAndIdleStreak() throws {

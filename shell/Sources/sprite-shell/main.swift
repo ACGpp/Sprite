@@ -180,6 +180,7 @@ func spriteShellMain() {
 		let section: RecordsView.Section
 		switch sectionArg {
 		case "settings": section = .settings
+		case "memory": section = .memory
 		case "diary": section = .diary
 		case "voice": section = .voice
 		case "conversations": section = .conversations
@@ -195,7 +196,7 @@ func spriteShellMain() {
 		let window = RecordsWindow.make(model: model, section: section)
 		window.orderFrontRegardless()
 		var ticks = 0
-		let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in ticks += 1 }
+		let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in MainActor.assumeIsolated { ticks += 1 } }
 		let deadline = Date().addingTimeInterval(3)
 		while Date() < deadline {
 			RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
@@ -941,7 +942,8 @@ func spriteShellMain() {
 		exit(ok ? 0 : 1)
 	}
 
-	let delegate = AppDelegate(socketPath: socketPath)
+	let initialRecords: RecordsSectionRequest? = ["memory": .memory, "conversations": .conversations, "live": .live][argumentValue("--open-records") ?? ""]
+	let delegate = AppDelegate(socketPath: socketPath, initialRecords: initialRecords)
 	application.delegate = delegate
 	application.run()
 

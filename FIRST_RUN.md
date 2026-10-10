@@ -7,21 +7,14 @@ Budget about an hour for the setup and the first conversation, then leave it run
 
 ## 0. Setup (~30 min)
 
-Requirements: macOS 14+, Node 22+, Xcode command line tools, and
-[pi](https://github.com/badlogic/pi-mono) (`npm install -g @mariozechner/pi-coding-agent`).
-
-```bash
-git clone https://github.com/ACGpp/Sprite.git
-cd Sprite
-./install.sh
-```
+Download the DMG matching your Mac from [Releases](https://github.com/ACGpp/Sprite/releases), drag Sprite into Applications, and open it. Requires macOS 14+; Node, pi and the kernel are bundled. If no binary release is available yet, follow the [source installation](README_EN.md#run-from-source). See [installation help](INSTALL.md) for first launch and macOS security prompts.
 
 **While installing, note anything you had to guess.** That list is gold: it is exactly what a
 non-technical user will hit.
 
 - Never paste your API key into an issue, a screenshot, or a commit.
-- Your memory stays on your machine, in `~/.claude-memory`. The only outbound traffic is the model
-  API call to the provider you configure.
+- Memory is stored in `~/.claude-memory`. Messages and selected memory context are sent to your
+  model provider. Full mode can also access the network; system speech recognition may send audio to Apple.
 - The app is ad-hoc signed. Building it yourself is fine; a downloaded build would be blocked by
   Gatekeeper, and after any rebuild macOS may ask for microphone permission again.
 
@@ -57,10 +50,10 @@ Tell us that — it is a product metric, not a bug report.
 In the journal you can see it choosing its own rhythm:
 
 ```bash
-grep breath.scheduled ~/.claude-memory/journal/$(date +%F).jsonl | tail -3
+grep breath.scheduled ~/.claude-memory/journal/$(TZ=Asia/Shanghai date +%F).jsonl | tail -3
 ```
 
-It pushes its next wake-up 1.5–6 hours out on its own. Does that read to you as "it has a life", or
+It pushes its next wake-up 30 seconds–6 hours out on its own. Does that read to you as "it has a life", or
 as "it is lazy"? Both answers are useful.
 
 ## 5. Signs of life
@@ -68,7 +61,7 @@ as "it is lazy"? Both answers are useful.
 This is the part we care about most. Look for evidence that it is doing something with its time:
 
 - a new file in `~/.claude-memory/diary/`, or edits to `context/working-memory.md`
-- using `bash` to look around its own folders, or reading something it wrote before
+- reading something it wrote before, or using `bash` if you explicitly enabled full mode
 - holding a message back during quiet hours and handing it over in the morning (the conversation log
   shows it as a held-back message)
 - the panel readout: `today: woke N · wrote X · read Y · spoke Z`
@@ -86,7 +79,7 @@ If the transcript looks too short, this prints the total duration, the seconds t
 speech, and the peak level:
 
 ```bash
-cd sprite            # your checkout
+cd Sprite            # your checkout
 shell/.build/debug/sprite-shell --voice-levels ~/.claude-memory/voice/<file>.m4a
 ```
 
@@ -100,14 +93,14 @@ The interface follows your system language; you can force it in **Settings → L
 records window.
 
 What your Sprite *writes* — diary entries, notes, messages — is not translated. It writes in the
-language you talk to it in, because that is its memory, not UI chrome. Talk to it in English and its
-diary will be English; say nothing and it starts from whatever it read.
+language you talk to it in, because that is its memory, not UI chrome. You can ask it to write in English; the model chooses its output language from context and instructions,
+so an English interface alone does not guarantee English diary entries.
 
 ## Not bugs, by design
 
 - **It sleeps for hours.** Its wake-up times are its own choice, not a stall.
-- **Silence during quiet hours** (23:00–07:00 by default). It still reads and writes, it just does not
-  speak; anything it wanted to say is handed back in the morning.
+- **Quiet hours** (23:00–07:00 Shanghai time by default). Proactive speech becomes a held message,
+  and normal incoming messages wait. The explicit wake-now action can bypass that window.
 - **A weak or fast model looks passive.** The default model choice matters a lot for how alive it
   feels; a small model tends to say "still nothing to do" and go back to sleep.
 - **macOS asks for microphone permission again** after you rebuild the app (ad-hoc signing).

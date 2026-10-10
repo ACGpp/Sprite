@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import SpriteRPC
 
 /// 对话流：我说的 + 它说的。
 ///
@@ -27,6 +28,13 @@ struct ConversationView: View {
 			header
 			thread
 			inputRow
+			if let status = model.conversationInputStatus {
+				Label(status, systemImage: model.connected ? "exclamationmark.triangle" : "wifi.slash")
+					.font(.system(size: compact ? 10 : 12))
+					.foregroundStyle(.orange)
+					.fixedSize(horizontal: false, vertical: true)
+					.textSelection(.enabled)
+			}
 		}
 	}
 
@@ -96,6 +104,18 @@ struct ConversationView: View {
 					ForEach(visibleTurns) { turn in
 						bubble(turn).id(turn.id)
 					}
+					ForEach(model.state?.unsettledMessages ?? []) { unsettled in
+						VStack(alignment: .leading, spacing: 4) {
+							Label(L("这轮执行未完成，结果尚未确认"), systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+							ForEach(unsettled.messages, id: \.seq) { message in Text(message.text).textSelection(.enabled) }
+							Text(unsettled.reason).font(.caption).foregroundStyle(.secondary)
+							Text(L("可能已有部分操作完成。请先核对结果，再决定下一步。")).font(.caption)
+						}
+						.padding(8)
+					}
+					ForEach(model.pendingQuestions) { question in
+						QuestionCard(model: model, question: question)
+					}
 					if model.isThinking {
 						thinkingRow.id("thinking")
 					}
@@ -155,6 +175,13 @@ struct ConversationView: View {
 						.stroke(turn.fromMe ? Color.accentColor.opacity(0.45) : Color.clear, lineWidth: 1)
 				)
 				.opacity(turn.pending ? 0.65 : 1)
+			if let failure = turn.failure {
+				Text(Lf("发送未确认：%@", failure)).font(.caption).foregroundStyle(.red)
+				Button(L("重试")) { model.retryMessage(id: turn.id) }
+					.disabled(!model.connected)
+			} else if turn.pending {
+				Text(L("发送中…")).font(.caption).foregroundStyle(.secondary)
+			}
 		}
 		.frame(maxWidth: .infinity, alignment: turn.fromMe ? .trailing : .leading)
 	}
@@ -192,7 +219,7 @@ struct ConversationView: View {
 			.help(model.isRecording ? L("停止并转写") : L("点一下开始录音，再点一下停止并转写"))
 			Button(L("送出"), action: send)
 				.buttonStyle(.borderedProminent)
-				.disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+				.disabled(!model.canSendDraft)
 		}
 		.onChange(of: model.focusInputToken) { _, _ in inputFocused = true }
 		.onAppear { if !compact { inputFocused = true } }
@@ -215,6 +242,42 @@ struct ConversationView: View {
 		formatter.dateFormat = "HH:mm"
 		return formatter
 	}()
+}
+
+/// 回答必须绑定具体问题，关闭窗口并不构成同意。
+private struct QuestionCard: View {
+	@ObservedObject var model: ShellModel
+	let question: PendingQuestion
+	@State private var answer = ""
+	private var isMemoryProposal: Bool { question.questionId.hasPrefix("memory:") }
+
+	var body: some View {
+		VStack(alignment: .leading, spacing: 8) {
+			Label(L(isMemoryProposal ? "记忆修改待确认" : "它在等你回答"), systemImage: "questionmark.bubble").font(.caption).foregroundStyle(.secondary)
+			if isMemoryProposal {
+				ScrollView { Text(question.question).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+					.frame(maxHeight: 320)
+			} else {
+				Text(question.question).textSelection(.enabled)
+			}
+			ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
+				Button(isMemoryProposal ? L(option) : option) { model.answerQuestion(question.questionId, answer: option) }
+					.disabled(!model.connected || model.answeringQuestions.contains(question.questionId))
+			}
+			if !isMemoryProposal { HStack {
+				TextField(L("输入你的回答…"), text: $answer).textFieldStyle(.roundedBorder)
+				Button(L("回答")) { model.answerQuestion(question.questionId, answer: answer) }
+					.disabled(answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !model.connected || model.answeringQuestions.contains(question.questionId))
+			} }
+			if model.answeringQuestions.contains(question.questionId) { ProgressView().controlSize(.small) }
+			if let failure = model.questionErrors[question.questionId] {
+				Text(failure).font(.caption).foregroundStyle(.red)
+			}
+		}
+		.padding(10)
+		.frame(maxWidth: .infinity, alignment: .leading)
+		.background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+	}
 }
 
 /// 跟踪"你是不是已经在底部"。

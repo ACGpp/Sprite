@@ -1,0 +1,14 @@
+{
+  "name": "sprite-bundled-runtime",
+  "version": "0.3.4",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.70.2"
+  },
+  "overrides": {
+    "@mariozechner/pi-agent-core": "0.70.2",
+    "@mariozechner/pi-ai": "0.70.2",
+    "@mariozechner/pi-tui": "0.70.2"
+  }
+}

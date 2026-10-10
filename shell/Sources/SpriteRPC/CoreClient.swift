@@ -60,6 +60,11 @@ public final class CoreClient: @unchecked Sendable {
 		try request(type: "command", command: ["id": id, "type": "breath.resume"])
 	}
 
+	@discardableResult
+	public func answerQuestion(questionId: String, answer: String, id: String = UUID().uuidString) throws -> JSONValue {
+		try request(type: "command", command: ["id": id, "type": "question.answer", "questionId": questionId, "answer": answer])
+	}
+
 	/// 原始请求（给不被常用路径覆盖的查询用，例如记录读取）
 	public func requestRaw(_ payload: [String: Any]) throws -> JSONValue {
 		try requestEnvelope(payload)

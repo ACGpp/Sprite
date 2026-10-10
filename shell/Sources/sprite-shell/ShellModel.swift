@@ -3,10 +3,12 @@ import Foundation
 import SpriteRPC
 
 /// 请求打开记录窗口的哪个分区
-public enum RecordsSectionRequest {
+public enum RecordsSectionRequest: Equatable {
 	case live
 	case voice
 	case diary
+	case conversations
+	case memory
 	case settings
 }
 
@@ -19,6 +21,12 @@ public enum RecordsSectionRequest {
 /// 这也是 Swift 6 并发检查要求的结构——以前靠自觉，现在由编译器守。
 @MainActor
 public final class ShellModel: ObservableObject {
+	@Published public private(set) var recordsRequest: RecordsSectionRequest = .live
+	@Published public private(set) var recordsRequestToken = UUID()
+	public func navigateRecords(to request: RecordsSectionRequest) {
+		recordsRequest = request
+		recordsRequestToken = UUID()
+	}
 	public private(set) var state: KernelState?
 	public private(set) var snapshot: KernelSnapshot?
 	public private(set) var lastEventSeq: Int = 0
@@ -61,24 +69,11 @@ public final class ShellModel: ObservableObject {
 				onMain { finish(responseBox.value, nil) }
 			} catch {
 				let message = String(describing: error)
-				onMain { finish(nil, message) }
+				onMain {
+					self.handleRequestFailure(error, client: client)
+					finish(nil, message)
+				}
 			}
-		}
-	}
-
-	/// 后台写一次、主线程读一次的结果箱子（跨隔离域传"一次性结果"用）
-	final class ResultBox: @unchecked Sendable {
-		private let lock = NSLock()
-		private var stored: String?
-		func set(_ value: String) {
-			lock.lock()
-			stored = value
-			lock.unlock()
-		}
-		var value: String? {
-			lock.lock()
-			defer { lock.unlock() }
-			return stored
 		}
 	}
 
@@ -116,20 +111,22 @@ public final class ShellModel: ObservableObject {
 	public var conversation: [Turn] {
 		Conversation.merge(
 			messages: state?.messages ?? [],
-			outgoing: state?.outgoing ?? [],
-			optimistic: optimisticIncoming
-		)
+			outgoing: state?.outgoing ?? []
+		) + localDeliveries.map { Turn(id: $0.id, fromMe: true, text: $0.text, at: $0.at, seq: Int.max, pending: $0.failure == nil, failure: $0.failure) }
 	}
 
 
-	/// 「现在」用的对话流：**不含导入的旧历史**（归档在「对话记录」里看）
+	/// 心跳在跨日时刷新，即使没有新消息，「现在」也会进入新的一天。
+	@Published private var conversationNow = Date()
+
+	/// 「现在」只显示上海时区今天的新对话。
 	public var liveConversation: [Turn] {
-		Conversation.live(conversation)
+		Conversation.live(conversation, now: conversationNow)
 	}
 
 	/// 归档里还有多少条更早的（界面上要如实指个路）
 	public var archivedTurnCount: Int {
-		conversation.filter(\.imported).count
+		conversation.count - liveConversation.count
 	}
 
 	/// 它在想事情吗（有等待感的那一段）
@@ -143,6 +140,8 @@ public final class ShellModel: ObservableObject {
 
 	/// 由心跳调用：把"它在想多久"算出来（只在数字变了才发通知，避免无意义重绘）
 	public func refreshThinkingClock() {
+		let now = Date()
+		if Conversation.dayStart(now) != Conversation.dayStart(conversationNow) { conversationNow = now }
 		guard isThinking, let started = lastIncomingAt else {
 			if thinkingSeconds != 0 { thinkingSeconds = 0 }
 			return
@@ -177,7 +176,10 @@ public final class ShellModel: ObservableObject {
 	///
 	/// 真实用户反馈：录音时面板被关掉，回来后"内容丢失"。原因是字存在视图的 @State
 	/// 里、而转写结果从来没被视图读过。状态放在模型里，面板开关多少次都不会丢。
-	@Published public var draft = ""
+	@Published public var draft = "" {
+		didSet { if draft != oldValue { recoveredDraftID = nil } }
+	}
+	private var recoveredDraftID: String?
 
 	/// 语音归档结果（存到哪儿了 / 为什么没存上）——如实说，不假装成功
 	@Published public var archiveNote: String?
@@ -501,24 +503,33 @@ public final class ShellModel: ObservableObject {
 	}
 
 	/// 拉一批记录（对话 / 思维流 / 日记 / 探索笔记）——只读，由内核交出
-	public func loadRecords(kind: String, limit: Int = 60, attempt: Int = 0, completion: @escaping @MainActor @Sendable ([[String: String]]) -> Void) {
+	public func loadRecords(kind: String, limit: Int = 60, attempt: Int = 0, beforeDate: String? = nil, pageInfo: @escaping @MainActor @Sendable (String?) -> Void = { _ in }, onFailure: @escaping @MainActor @Sendable (String) -> Void = { _ in }, completion: @escaping @MainActor @Sendable ([[String: String]]) -> Void) {
 		guard client != nil, connected else {
 			// 真实用户反馈："思维流空了"。原因就是这个 return：面板刚开、
 			// 内核还没连上时悄悄返回空列表，而且**再也不重试**——界面就永远空着。
 			// 现在：没连上就等一会儿再来，直到连上为止。
-			guard attempt < 20, !stopped else { completion([]); return }
+			guard attempt < 20, !stopped else {
+				let failure = recordsError ?? L("内核未连接，暂时无法加载记录")
+				recordsError = failure
+				onFailure(failure)
+				completion([])
+				return
+			}
 			mainAsyncAfter(.now() + 0.5) { [self] in
-				loadRecords(kind: kind, limit: limit, attempt: attempt + 1, completion: completion)
+				loadRecords(kind: kind, limit: limit, attempt: attempt + 1, beforeDate: beforeDate, pageInfo: pageInfo, onFailure: onFailure, completion: completion)
 			}
 			return
 		}
-		requestInBackground(["id": UUID().uuidString, "type": "query.records", "kind": kind, "limit": limit, "protocolVersion": protocolVersion], client: client) { [self] response, failure in
+		var payload: [String: Any] = ["id": UUID().uuidString, "type": "query.records", "kind": kind, "limit": limit, "protocolVersion": protocolVersion]
+		if let beforeDate { payload["beforeDate"] = beforeDate }
+		requestInBackground(payload, client: client) { [self] response, failure in
 			guard let response else {
-				recordsError = failure
-				// 请求本身失败（内核正忙/刚重启）：等下一拍重来，不要给用户一个假"空"
+				recordsError = failure ?? L("加载记录失败")
+				onFailure(recordsError!)
+				// 请求本身失败（内核正忙/刚重启）：原因已显示，继续尝试重连。
 				guard attempt < 20, !stopped else { completion([]); return }
 				mainAsyncAfter(.now() + 0.6) { [self] in
-					loadRecords(kind: kind, limit: limit, attempt: attempt + 1, completion: completion)
+					loadRecords(kind: kind, limit: limit, attempt: attempt + 1, beforeDate: beforeDate, pageInfo: pageInfo, onFailure: onFailure, completion: completion)
 				}
 				return
 			}
@@ -542,14 +553,36 @@ public final class ShellModel: ObservableObject {
 				}
 			}
 			recordsError = nil
+			pageInfo(response.objectValue?["nextCursor"]?.stringValue)
 			completion(entries)
 		}
 	}
 
 	/// 读一篇记录的正文
-	public func loadDocument(path: String, completion: @escaping @MainActor @Sendable (String) -> Void) {
-		requestInBackground(["id": UUID().uuidString, "type": "query.document", "path": path, "protocolVersion": protocolVersion], client: client) { response, _ in
-			completion(response?.objectValue?["text"]?.stringValue ?? "")
+	/// 用户的记忆管理操作走独立 RPC；不会扩大 Agent 工具权限。
+	func manageMemory(_ parameters: [String: JSONValue], completion: @escaping @MainActor @Sendable (Result<JSONValue, MemoryManagementFailure>) -> Void) {
+		guard connected, client != nil else {
+			completion(.failure(MemoryManagementFailure(message: L("内核未连接，请连接后重试"))))
+			return
+		}
+		var payload: [String: Any] = ["id": UUID().uuidString, "type": "memory.manage", "protocolVersion": protocolVersion]
+		for (key, value) in parameters {
+			if let text = value.stringValue { payload[key] = text }
+		}
+		requestInBackground(payload, client: client) { response, failure in
+			if let response { completion(.success(response)) }
+			else { completion(.failure(MemoryManagementFailure(message: failure ?? L("内核没有回应")))) }
+		}
+	}
+
+	public func loadDocument(path: String, onFailure: @escaping @MainActor @Sendable (String) -> Void = { _ in }, completion: @escaping @MainActor @Sendable (String) -> Void) {
+		requestInBackground(["id": UUID().uuidString, "type": "query.document", "path": path, "protocolVersion": protocolVersion], client: client) { response, failure in
+			guard let text = response?.objectValue?["text"]?.stringValue else {
+				onFailure(failure ?? L("记录正文加载失败"))
+				completion("")
+				return
+			}
+			completion(text)
 		}
 	}
 	/// 录音开关（由 AppDelegate 接线）
@@ -633,7 +666,10 @@ public final class ShellModel: ObservableObject {
 				try client.subscribe(fromSeq: snapshot.seq, onEvent: { [self] event in
 					onMain { self.apply(event) }
 				}, onError: { [self] error in
-					onMain { self.handleDisconnect(error) }
+					onMain {
+						guard !self.stopped, self.client === client else { return }
+						self.handleDisconnect(error)
+					}
 				})
 				onMain {
 					guard !self.stopped else { return }
@@ -662,6 +698,15 @@ public final class ShellModel: ObservableObject {
 		}
 	}
 
+	/// 请求连接和事件订阅彼此独立；任何请求的传输故障都必须重建两条连接。
+	/// 业务拒绝不代表断线，旧连接的迟到错误也不能关闭已经恢复的新连接。
+	private func handleRequestFailure(_ error: Error, client: CoreClient) {
+		guard !stopped, self.client === client else { return }
+		if let rpcError = error as? CoreClientError, case .rejected = rpcError { return }
+		guard error is CoreClientError else { return }
+		handleDisconnect(error)
+	}
+
 	private func handleDisconnect(_ error: Error) {
 		connected = false
 		connectionError = "\(error)"
@@ -682,7 +727,7 @@ public final class ShellModel: ObservableObject {
 	/// 退避重连：1s → 2s → 4s → … 最多 30s。内核重启是常态（升级、崩溃恢复），
 	/// 外壳不能因此永久失效——它必须自己走回去。
 	private func scheduleReconnect(isFirstAttempt: Bool = false) {
-		guard !stopped else { return }
+		guard !stopped, !reconnectScheduled else { return }
 		reconnectAttempts += 1
 		let delay = min(30.0, pow(2.0, Double(reconnectAttempts - 1)))
 		reconnectScheduled = true
@@ -695,6 +740,7 @@ public final class ShellModel: ObservableObject {
 
 	public func stop() {
 		stopped = true
+		connected = false
 		subscriptionCancel()
 		client?.close()
 		client = nil
@@ -706,59 +752,122 @@ public final class ShellModel: ObservableObject {
 
 	// MARK: - 用户动作（全部走命令，幂等键由外壳生成）
 
-	/// 发送一句话。返回 false 表示**没发出去**（调用方必须把内容还给用户，不能悄悄吞掉）。
+	/// 输入状态不依赖对话是否为空：已有聊天内容时断线也必须可见。
+	public var conversationInputStatus: String? {
+		if !connected { return L("内核未连接，正在自动重连。草稿会保留，不会自动发送。") }
+		return connectionError
+	}
+
+	public var canSendDraft: Bool { connected && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+	/// true 表示进入本地发送队列；最终成功或失败由异步响应与事件确认。
 	@discardableResult
 	public func sendMessage(_ text: String) -> Bool {
 		let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
 		guard !trimmed.isEmpty else { return false }
-		guard let client else {
-			// 曾经这里直接 return —— 用户以为发出去了，其实什么都没发生。
+		guard client != nil, connected else {
 			connectionError = L("内核没连上，这句话没有发出去（内容已留在输入框）")
 			onChange?()
 			return false
 		}
-
-		// 先本地乐观显示：点下发送就该立刻看到，而不是等内核回事件
-		optimisticIncoming.append(trimmed)
-		onChange?()
-
-		// 阻塞式 RPC 放到后台：内核偶尔繁忙（例如它正在跑模型的 RPC），
-		// 在主线程序列化等待会让界面直接冻住（评审 M9）
-		// 结果放进不可变箱子：后台闭包只写一次，主线程读一次（不需要锁，也不给编译器留把柄）
-		let sent = DispatchSemaphore(value: 0)
-		let failureBox = ResultBox()
-		DispatchQueue.global(qos: .userInitiated).async {
-			do {
-				_ = try client.sendMessage(text: trimmed)
-			} catch {
-				failureBox.set(String(describing: error))
-			}
-			sent.signal()
-		}
-		// 最多等 1 秒：等不到就当作"已发出"，由事件流来确认（乐观回显已经显示）
-		if sent.wait(timeout: .now() + 1.0) == .timedOut {
-			connectionError = nil
+		if let id = recoveredDraftID, let failed = localDeliveries.first(where: { $0.id == id && $0.failure != nil }), failed.text == trimmed {
+			retryMessage(id: id)
 			return true
 		}
-		if let failure = failureBox.value {
-			optimisticIncoming.removeAll { $0 == trimmed }
-			connectionError = "发送失败：\(failure)（内容已留在输入框）"
-			onChange?()
-			return false
-		}
-		connectionError = nil
+		let delivery = LocalDelivery(id: UUID().uuidString, text: trimmed, at: ISO8601DateFormatter().string(from: Date()))
+		localDeliveries.append(delivery)
+		dispatchDelivery(delivery)
 		return true
 	}
 
-	/// 已发送但内核还没回件的本地回显（内核事件到达后自动清掉）
-	private var optimisticIncoming: [String] = []
+	private struct LocalDelivery: Sendable {
+		let id: String
+		let text: String
+		let at: String
+		var failure: String?
+	}
+	@Published private var localDeliveries: [LocalDelivery] = []
 
-	/// 快照刷新/重连时清掉乐观回显：新状态里已经有真实的那条了，
-	/// 留着会永久显示"你（发送中）"，而且和快照里的同一条**重复**。
+	/// 重试沿用消息 ID。即使上一请求已落库但回执丢失，也不会生成第二条消息。
+	public func retryMessage(id: String) {
+		guard client != nil, connected,
+			let index = localDeliveries.firstIndex(where: { $0.id == id && $0.failure != nil }) else { return }
+		localDeliveries[index].failure = nil
+		let delivery = localDeliveries[index]
+		if recoveredDraftID == id { draft = "" }
+		dispatchDelivery(delivery)
+	}
+
+	private func dispatchDelivery(_ delivery: LocalDelivery) {
+		guard let client else { return }
+		connectionError = nil
+		DispatchQueue.global(qos: .userInitiated).async { [self] in
+			do {
+				_ = try client.sendMessage(text: delivery.text, id: delivery.id)
+				onMain { self.refreshNow() }
+			} catch {
+				let failure = String(describing: error)
+				onMain {
+					guard !self.stopped, let index = self.localDeliveries.firstIndex(where: { $0.id == delivery.id }) else { return }
+					self.localDeliveries[index].failure = failure
+					self.connectionError = Lf("发送未确认：%@（可重试）", failure)
+					if self.draft.isEmpty {
+						self.draft = delivery.text
+						self.recoveredDraftID = delivery.id
+					}
+					self.onChange?()
+					self.handleRequestFailure(error, client: client)
+				}
+			}
+		}
+	}
+
+	/// 只按内核回传的稳定 ID 对账；相同文本的两次发送是两条消息。
 	private func reconcileOptimisticEchoes() {
-		guard !optimisticIncoming.isEmpty, let state else { return }
-		optimisticIncoming.removeAll { text in
-			state.messages.contains { $0.text == text }
+		let confirmed = Set((state?.messages ?? []).compactMap(\.id))
+		if let id = recoveredDraftID, confirmed.contains(id) {
+			draft = "" // 只有仍未编辑的自动恢复草稿可以随确认清除。
+		}
+		localDeliveries.removeAll { confirmed.contains($0.id) }
+	}
+
+	@Published public private(set) var answeringQuestions: Set<String> = []
+	@Published public private(set) var questionErrors: [String: String] = [:]
+	public var pendingQuestions: [PendingQuestion] { state?.questions ?? [] }
+
+	private var questionAnswerAttempts: [String: (answer: String, id: String)] = [:]
+
+	public func answerQuestion(_ questionId: String, answer: String) {
+		let answer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+		guard !answer.isEmpty, !answeringQuestions.contains(questionId),
+			pendingQuestions.contains(where: { $0.questionId == questionId }) else { return }
+		guard let client, connected else {
+			questionErrors[questionId] = L("内核没连上，回答尚未送达")
+			return
+		}
+		answeringQuestions.insert(questionId)
+		questionErrors[questionId] = nil
+		let previous = questionAnswerAttempts[questionId]
+		let commandID = previous?.answer == answer ? previous!.id : UUID().uuidString
+		questionAnswerAttempts[questionId] = (answer, commandID)
+		DispatchQueue.global(qos: .userInitiated).async { [self] in
+			do {
+				_ = try client.answerQuestion(questionId: questionId, answer: answer, id: commandID)
+				onMain {
+					self.state = self.state?.resolvingQuestion(questionId)
+					self.answeringQuestions.remove(questionId)
+					self.questionAnswerAttempts.removeValue(forKey: questionId)
+					self.objectWillChange.send()
+					self.refreshNow()
+				}
+			} catch {
+				let failure = String(describing: error)
+				onMain {
+					self.answeringQuestions.remove(questionId)
+					self.questionErrors[questionId] = "回答失败：\(failure)"
+					self.handleRequestFailure(error, client: client)
+				}
+			}
 		}
 	}
 
@@ -796,7 +905,10 @@ public final class ShellModel: ObservableObject {
 					}
 				}
 			} catch {
-				onMain { self.setWakeNotice("叫醒失败：\(error)", seconds: 15) }
+				onMain {
+					self.setWakeNotice("叫醒失败：\(error)", seconds: 15)
+					self.handleRequestFailure(error, client: client)
+				}
 			}
 		}
 	}
@@ -810,6 +922,7 @@ public final class ShellModel: ObservableObject {
 			} catch {
 				onMain {
 					self.connectionError = "\(label)失败: \(error)"
+					self.handleRequestFailure(error, client: client)
 					self.onChange?()
 				}
 			}
@@ -840,7 +953,7 @@ public final class ShellModel: ObservableObject {
 			entries += state.outgoing.filter { $0.imported != true }.map { (L("它"), $0.text, $0.seq + 1) }
 		}
 		// 还没被内核确认的排在最**后**（最新的话在最下面），用大序号保证顺序稳定
-		entries += optimisticIncoming.enumerated().map { (L("你（发送中）"), $0.element, Int.max - 1000 + $0.offset) }
+		entries += localDeliveries.enumerated().map { (L($0.element.failure == nil ? "你（发送中）" : "你（发送失败）"), $0.element.text, Int.max - 1000 + $0.offset) }
 		return entries.sorted { $0.2 < $1.2 }.map { (speaker: $0.0, text: $0.1) }
 	}
 
@@ -848,18 +961,19 @@ public final class ShellModel: ObservableObject {
 	/// 不重连、不改订阅——只是把最新事实取回来。
 	public func refreshNow() {
 		guard let client else { return }
-		DispatchQueue.global(qos: .userInitiated).async {
-			// 两个响应都不是 Sendable：装箱（不可变快照）带回主线程
-			let snapshotBox = Immutable(try? client.snapshot())
-			let statusBox = Immutable(try? client.status())
-			onMain { [self] in
-				if let snapshot = snapshotBox.value {
-					self.snapshot = snapshot
-					self.lastEventSeq = max(self.lastEventSeq, snapshot.seq)
+		DispatchQueue.global(qos: .userInitiated).async { [self] in
+			do {
+				let snapshotBox = Immutable(try client.snapshot())
+				let statusBox = Immutable(try client.status())
+				onMain {
+					guard !self.stopped, self.client === client else { return }
+					self.snapshot = snapshotBox.value
+					self.lastEventSeq = max(self.lastEventSeq, snapshotBox.value.seq)
+					self.state = statusBox.value
+					self.reconcileOptimisticEchoes()
+					self.onChange?()
 				}
-				if let status = statusBox.value { self.state = status }
-				self.onChange?()
-			}
+			} catch { onMain { self.handleRequestFailure(error, client: client) } }
 		}
 	}
 
@@ -870,6 +984,8 @@ public final class ShellModel: ObservableObject {
 		lastEventSeq = max(lastEventSeq, event.seq)
 		onEvent?(event)
 		switch SpriteEvent.KnownEventType(rawValue: event.type) {
+		case .identityChanged:
+			if event.data["companionName"] != nil { state = state?.withCompanionName(event.data["companionName"]?.stringValue) }
 		case .presenceChanged:
 			if let raw = event.data["state"]?.stringValue, let presence = PresenceState(rawValue: raw) {
 				state = state?.withPresence(presence)
@@ -884,8 +1000,8 @@ public final class ShellModel: ObservableObject {
 			}
 		case .messageIn:
 			if let text = event.data["text"]?.stringValue, let current = state {
-				state = current.appendingIncoming(text: text, seq: event.seq, at: event.at)
-				optimisticIncoming.removeAll { $0 == text }
+				state = current.appendingIncoming(text: text, seq: event.seq, at: event.at, id: event.data["id"]?.stringValue)
+				reconcileOptimisticEchoes()
 			}
 		case .thoughtRecorded:
 			if let text = event.data["text"]?.stringValue, let current = state {
@@ -915,8 +1031,14 @@ public final class ShellModel: ObservableObject {
 		case .questionAsked:
 			if let current = state, let question = event.data["question"]?.stringValue {
 				let options = event.data["options"]?.arrayValue?.compactMap { $0.stringValue } ?? []
-				state = current.appendingQuestion(PendingQuestion(question: question, options: options, seq: event.seq, at: event.at))
+				state = current.appendingQuestion(PendingQuestion(question: question, options: options, seq: event.seq, at: event.at, questionId: event.data["questionId"]?.stringValue))
 				onQuestion?(question, options)
+			}
+		case .questionAnswered:
+			if let id = event.data["questionId"]?.stringValue {
+				state = state?.resolvingQuestion(id)
+				answeringQuestions.remove(id)
+				questionErrors[id] = nil
 			}
 		default:
 			break // 未知事件类型：忽略而不是崩溃（前向兼容）
@@ -940,13 +1062,16 @@ public final class ShellModel: ObservableObject {
 			self.statusRefreshScheduled = false
 			guard let client = self.client else { return }
 			// 阻塞调用放到后台队列：内核偶尔繁忙时不能把界面冻住
-			DispatchQueue.global(qos: .utility).async {
-				let freshBox = Immutable(try? client.status())
-				onMain { [self] in
-					guard let fresh = freshBox.value else { return }
-					self.state = fresh
-					self.onChange?()
-				}
+			DispatchQueue.global(qos: .utility).async { [self] in
+				do {
+					let freshBox = Immutable(try client.status())
+					onMain {
+						guard !self.stopped, self.client === client else { return }
+						self.state = freshBox.value
+						self.reconcileOptimisticEchoes()
+						self.onChange?()
+					}
+				} catch { onMain { self.handleRequestFailure(error, client: client) } }
 			}
 		}
 	}
@@ -1087,7 +1212,8 @@ extension KernelState {
 		activities: [RunActivity]? = nil,
 		questions: [PendingQuestion]? = nil,
 		messages: [IncomingMessage]? = nil,
-		problems: [String]? = nil
+		problems: [String]? = nil,
+		companionName: String?? = nil
 	) -> KernelState {
 		KernelState(
 			presence: presence ?? self.presence,
@@ -1105,7 +1231,10 @@ extension KernelState {
 			failures: failures,
 			problems: problems ?? self.problems,
 			// 漏了这个字段 → 每折叠一条事件名字就被抹成 nil，面板里的名字会闪回"它"
-			companionName: companionName
+			companionName: companionName ?? self.companionName,
+			today: today,
+			idleStreak: idleStreak,
+			unsettledMessages: unsettledMessages
 		)
 	}
 
@@ -1113,8 +1242,8 @@ extension KernelState {
 		copy(presence: presence)
 	}
 
-	func appendingIncoming(text: String, seq: Int, at: String) -> KernelState {
-		copy(messages: messages + [IncomingMessage(text: text, source: "text", seq: seq, at: at, imported: false)])
+	func appendingIncoming(text: String, seq: Int, at: String, id: String?) -> KernelState {
+		copy(messages: messages + [IncomingMessage(text: text, source: "text", seq: seq, at: at, imported: false, id: id)])
 	}
 
 	func appendingThought(_ text: String) -> KernelState {
@@ -1123,6 +1252,12 @@ extension KernelState {
 
 	func appendingActivity(_ activity: RunActivity) -> KernelState {
 		copy(activities: activities + [activity])
+	}
+
+	func withCompanionName(_ name: String?) -> KernelState { copy(companionName: .some(name)) }
+
+	func resolvingQuestion(_ questionId: String) -> KernelState {
+		copy(questions: questions.filter { $0.questionId != questionId })
 	}
 
 	func appendingQuestion(_ question: PendingQuestion) -> KernelState {

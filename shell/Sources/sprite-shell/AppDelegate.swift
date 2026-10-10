@@ -15,6 +15,7 @@ import SwiftUI
 @MainActor
 public final class AppDelegate: NSObject, NSApplicationDelegate {
 	private let socketPath: String
+	private let initialRecords: RecordsSectionRequest?
 	private let model: ShellModel
 	private let speech = SpeechService()
 	private let dictation = DictationService()
@@ -41,8 +42,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 	private var breathTimer: Timer?
 	private var iconPhase: Double = 0
 
-	public init(socketPath: String) {
+	public init(socketPath: String, initialRecords: RecordsSectionRequest? = nil) {
 		self.socketPath = socketPath
+		self.initialRecords = initialRecords
 		self.model = ShellModel(socketPath: socketPath)
 		super.init()
 	}
@@ -82,8 +84,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 			NSLog("Sprite: 快捷键 %@ 注册失败（可能被其他应用占用）", HotKey.displayName)
 		}
 
+		BundledRuntime.prepareIfPresent(socketPath: socketPath)
 		model.start()
 		updateStatusIcon()
+		if let initialRecords { openRecords(initialRecords) }
 	}
 
 	public func applicationWillTerminate(_ notification: Notification) {
@@ -345,16 +349,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
 	}
 
 	private func openRecords(_ request: RecordsSectionRequest = .live) {
+		model.navigateRecords(to: request)
 		if recordsWindow == nil {
 			// 走唯一的构造点（应用与 `--hang-check` 同一条路径，检查才有意义）
-			let section: RecordsView.Section = {
-				switch request {
-				case .live: return .live
-				case .voice: return .voice
-				case .settings: return .settings
-				case .diary: return .diary
-				}
-			}()
+			let section = RecordsView.Section(request: request)
 			let window = RecordsWindow.make(model: model, section: section)
 			window.delegate = self // 关闭时清掉"正在看现在"的标志（否则卡片再也不弹）
 			recordsWindow = window

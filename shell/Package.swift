@@ -12,6 +12,7 @@ let package = Package(
 		// 真正的应用：菜单栏 + 悬浮存在体
 		.executableTarget(name: "sprite-shell", dependencies: ["SpriteRPC"]),
 		.testTarget(name: "SpriteRPCTests", dependencies: ["SpriteRPC"]),
+		.testTarget(name: "SpriteShellTests", dependencies: ["sprite-shell", "SpriteRPC"]),
 	],
 	// **Swift 6 语言模式**：并发检查从"警告"变成"错误"。
 	// 迁移过程：`-strict-concurrency=complete` 从 886 条告警清到 0，再切到这里（见 docs/status.md §九）。

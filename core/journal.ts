@@ -197,11 +197,14 @@ export function openJournal(options: JournalOptions): Journal {
 	 * 原始日志永远是唯一事实来源，检查点只是加速器。
 	 */
 	type Checkpoint = {
+		/** v2 indexes committed effect prefixes as well as command.applied. */
+		commandIndexVersion: number;
 		seq: number;
 		/** 写入检查点时 journal 的总体积。日志只会增长；**变小就说明有人改过日志** */
 		journalBytes: number;
 		checksum: string;
 		appliedCommands: Array<[string, Record<string, unknown>]>;
+		commandPrefixes?: string[];
 		cursors: Array<[string, { offset: number; prefixHash: string; line: number }]>;
 		/** 每个来源"已经导入到第几行"（来自导入事件自带的行号标签） */
 		importLines: Array<[string, number]>;
@@ -215,7 +218,7 @@ export function openJournal(options: JournalOptions): Journal {
 		const parsed = JSON.parse(raw) as Checkpoint;
 		const body = JSON.stringify({ ...parsed, checksum: undefined });
 		const expected = crypto.createHash("sha256").update(body).digest("hex").slice(0, 16);
-		if (parsed.checksum === expected && Number.isInteger(parsed.seq) && parsed.seq > 0) checkpoint = parsed;
+		if (parsed.checksum === expected && parsed.commandIndexVersion === 2 && Number.isInteger(parsed.seq) && parsed.seq > 0) checkpoint = parsed;
 		// 日志只会增长。若当前体积比检查点记录的还小，说明日志被删改过——
 		// 此时检查点是"上一份内容的快照"，用它就会把已删除的东西复活（真实事故）。
 		if (checkpoint && journalBytesOnDisk() < checkpoint.journalBytes) {
@@ -227,6 +230,7 @@ export function openJournal(options: JournalOptions): Journal {
 	const events: JournalEvent[] = [];
 	const tornTails: TornTail[] = [];
 	const appliedCommands = new Map<string, Record<string, unknown>>();
+	const commandPrefixes = new Set<string>();
 	// 持久索引：从全部历史里建，但只留很小的结果（不随日志增长）
 	const cursors = new Map<string, { offset: number; prefixHash: string; line: number }>();
 	/**
@@ -249,6 +253,7 @@ export function openJournal(options: JournalOptions): Journal {
 		if (checkpointUsable) {
 			seq = checkpoint.seq;
 			for (const [id, result] of checkpoint.appliedCommands) appliedCommands.set(id, result);
+			for (const id of checkpoint.commandPrefixes ?? []) commandPrefixes.add(id);
 			for (const [key, value] of checkpoint.cursors) cursors.set(key, { offset: value.offset, prefixHash: value.prefixHash, line: value.line ?? 0 });
 			for (const [key, value] of checkpoint.importLines ?? []) importLines.set(key, value);
 			for (const file of checkpoint.handoffs) handoffs.add(file);
@@ -257,6 +262,7 @@ export function openJournal(options: JournalOptions): Journal {
 				// 快照用不了：把从它恢复的一切清掉，老老实实重扫
 				seq = 0;
 				appliedCommands.clear();
+				commandPrefixes.clear();
 				cursors.clear();
 				handoffs.clear();
 				importLines.clear();
@@ -406,7 +412,24 @@ export function openJournal(options: JournalOptions): Journal {
 	/** 维护持久索引：恢复扫描与运行期追加都必须走这里，否则本会话写入的游标不会生效。 */
 	function indexEvent(event: JournalEvent): void {
 		if (event.type === "command.applied" && typeof event.data.commandId === "string") {
-			appliedCommands.set(event.data.commandId, (event.data.result ?? {}) as Record<string, unknown>);
+			appliedCommands.set(event.data.commandId, (event.data.result ?? event.data) as Record<string, unknown>);
+			commandPrefixes.delete(event.data.commandId);
+		}
+		if (event.causeId && event.type !== "command.applied") {
+			const effect = event.data.__commandEffect as { index?: unknown; count?: unknown } | undefined;
+			// The final durable effect is itself a commit record. A crash before
+			// command.applied must not replay messages, answers or recorded voice.
+			const finalEffect = effect && Number.isInteger(effect.index) && Number.isInteger(effect.count)
+				&& Number(effect.count) > 0 && Number(effect.index) === Number(effect.count) - 1;
+			// Old versions emitted no effect metadata. These are their sole/final
+			// command effects; question.answered was only a prefix and is excluded.
+			const legacyFinal = effect === undefined && ["message.in", "voice.recorded", "voice.transcribed"].includes(event.type);
+			if (finalEffect || legacyFinal) {
+				appliedCommands.set(event.causeId, { commandId: event.causeId, effects: finalEffect ? Number(effect!.count) : 1 });
+				commandPrefixes.delete(event.causeId);
+			} else if (effect && Number(effect.count) > 1 && Number.isInteger(effect.index)) {
+				commandPrefixes.add(event.causeId);
+			}
 		}
 		// 导入事件自带的位置标签：断点靠它精确到行。
 		// **必须在下面那个 early return 之前**：带标签的事件大多是 message.in / thought.recorded，
@@ -482,9 +505,11 @@ export function openJournal(options: JournalOptions): Journal {
 			if (!checkpointPayload) return false;
 			try {
 				const body = {
+					commandIndexVersion: 2,
 					seq,
 					journalBytes: journalBytesOnDisk(),
 					appliedCommands: [...appliedCommands.entries()],
+					commandPrefixes: [...commandPrefixes],
 					cursors: [...cursors.entries()],
 					importLines: [...importLines.entries()],
 					handoffs: [...handoffs],
@@ -515,7 +540,13 @@ export function openJournal(options: JournalOptions): Journal {
 			if (appliedCommands.has(id)) {
 				return { applied: false, duplicate: true, result: appliedCommands.get(id) };
 			}
-			const written = produce().map((effect) => append(effect.type, effect.data, id));
+			// A legacy/future multi-effect command needs domain recovery after a
+			// partial write; blindly running produce again would repeat its prefix.
+			if (commandPrefixes.has(id)) throw new Error("命令仅部分落盘，需要恢复后才能重试");
+			const effects = produce();
+			const written = effects.map((effect, index) => append(effect.type, {
+				...effect.data, __commandEffect: { index, count: effects.length },
+			}, id));
 			const result: Record<string, unknown> = { commandId: id, effects: written.length };
 			append("command.applied", result, id);
 			appliedCommands.set(id, result);

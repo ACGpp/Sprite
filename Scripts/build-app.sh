@@ -39,8 +39,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleIdentifier</key><string>com.sprite.shell</string>
 	<key>CFBundleExecutable</key><string>Sprite</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>0.3.0</string>
-	<key>CFBundleVersion</key><string>3</string>
+	<key>CFBundleShortVersionString</key><string>0.3.4</string>
+	<key>CFBundleVersion</key><string>7</string>
 	<key>LSMinimumSystemVersion</key><string>14.0</string>
 	<!-- 菜单栏常驻应用：不出现在 Dock，也没有可关闭的主窗口 -->
 	<key>LSUIElement</key><true/>
@@ -48,7 +48,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Sprite 使用麦克风把你的语音转成文字；录音只在你主动按住时开始。</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Sprite 使用系统语音识别把你说的话转成文字；不使用云端识别。</string>
+	<string>Sprite 使用语音识别把你说的话转成文字；系统识别通道可能将音频发送给 Apple。</string>
 	<key>NSHumanReadableCopyright</key><string>MIT License</string>
 </dict>
 </plist>

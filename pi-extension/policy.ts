@@ -8,12 +8,15 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
+import { ORDINARY_MEMORY_DIRS, ORDINARY_MEMORY_FILES, REVIEWED_MEMORY_FILES } from "../contracts/memory-policy.ts";
 
 export const ALLOWED_ROOTS = (process.env.SPRITE_ALLOWED_ROOTS ?? "")
 	.split(":")
 	.filter(Boolean);
 
 export const MAX_SAYS_PER_RUN = 3;
+export const MEMORY_HOME = process.env.SPRITE_MEMORY_HOME ?? process.cwd();
 
 /**
  * 路径是否落在允许的根里。
@@ -29,7 +32,7 @@ export const MAX_SAYS_PER_RUN = 3;
  *   3. 对**最近存在的祖先**做 `realpath`，挡掉"符号链接指到外面"；
  *   4. 必须严格落在 `root + 分隔符` 之下（相等也算）。
  */
-export function inAllowedRoot(filePath: string, cwd: string = process.cwd()): boolean {
+export function inAllowedRoot(filePath: string, cwd: string = MEMORY_HOME): boolean {
 	if (ALLOWED_ROOTS.length === 0) return true; // 未配置 = 不限制（仅用于开发）
 	if (!filePath) return false;
 	// pi 侧会 expandPath(~) 再写：策略侧无法预知它展开成什么，所以直接拒绝
@@ -46,10 +49,18 @@ export function inAllowedRoot(filePath: string, cwd: string = process.cwd()): bo
 			const resolved = suffix ? path.join(real, suffix) : real;
 			return ALLOWED_ROOTS.some((root) => {
 				const rootReal = realpathOrSelf(root);
+				// identity.md is a single owned file, never a symlink-granted directory.
+				if (path.basename(root) === "identity.md") {
+					try { if (fs.lstatSync(root).isSymbolicLink()) return false; } catch { /* New identity file. */ }
+					return rootReal === path.resolve(root) && resolved === rootReal;
+				}
 				const prefix = rootReal.endsWith(path.sep) ? rootReal : rootReal + path.sep;
 				return resolved === rootReal || resolved.startsWith(prefix);
 			});
 		} catch {
+			// realpath also fails for dangling symlinks. Never treat one as an absent
+			// path component: write() would follow it when its destination is created.
+			try { if (fs.lstatSync(probe).isSymbolicLink()) return false; } catch { /* Absent component. */ }
 			const parent = path.dirname(probe);
 			if (parent === probe) return false;
 			suffix = suffix ? path.join(path.basename(probe), suffix) : path.basename(probe);
@@ -66,16 +77,55 @@ export function inAllowedRoot(filePath: string, cwd: string = process.cwd()): bo
  * 同 UID + bash 仍然是更大的洞（评审 C3/C4），这一条只是把"我们主动递钥匙"堵掉。
  */
 const SECRET_PATTERNS = [
-	/(^|\/)config\/(settings\.json|llm\.conf)$/,
-	/(^|\/)journal\//,
-	/(^|\/)runtime\//,
-	/(^|\/)sessions\//,
+	/(^|\/)config(\/|$)/,
+	/(^|\/)legacy-v2(\/|$)/,
+	/(^|\/)journal(\/|$)/,
+	/(^|\/)runtime(\/|$)/,
+	/(^|\/)sessions(\/|$)/,
 ];
 
-export function isSecretPath(filePath: string, cwd: string = process.cwd()): boolean {
+/** Content-only file tools: no surrounding machine, links or runtime directories. */
+export function isReadableMemoryPath(filePath: string, cwd = MEMORY_HOME): boolean {
+	if (!filePath || filePath.startsWith("~")) return false;
+	const full = path.resolve(cwd, filePath);
+	const relative = path.relative(path.resolve(cwd), full).split(path.sep).join("/");
+	if (relative.startsWith("../") || path.isAbsolute(relative) || isSecretPath(full, cwd)) return false;
+	const files: readonly string[] = [...ORDINARY_MEMORY_FILES, ...REVIEWED_MEMORY_FILES];
+	const dirs = [...ORDINARY_MEMORY_DIRS, "conversations", "thoughts"];
+	if (relative !== "" && relative !== "context" && !files.includes(relative) && !dirs.some(dir => relative === dir || relative.startsWith(`${dir}/`))) return false;
+	let probe = full;
+	while (true) {
+		try { if (fs.lstatSync(probe).isSymbolicLink()) return false; } catch { /* Missing content can be queried before creation. */ }
+		if (probe === path.resolve(cwd)) break;
+		const parent = path.dirname(probe);
+		if (parent === probe) return false;
+		probe = parent;
+	}
+	return true;
+}
+
+export function isSecretPath(filePath: string, cwd: string = MEMORY_HOME): boolean {
 	if (!filePath) return false;
-	const absolute = path.resolve(cwd, filePath);
-	return SECRET_PATTERNS.some((pattern) => pattern.test(absolute));
+	const absolute = path.resolve(cwd, filePath === "~" ? os.homedir() : filePath.startsWith("~/") ? path.join(os.homedir(), filePath.slice(2)) : filePath);
+	return [absolute, realpathOrSelf(absolute)].some(target => SECRET_PATTERNS.some(pattern => pattern.test(target)));
+}
+
+/** Search only ordinary files; never follow directory or file symlinks. */
+export function readableSearchFiles(target: string, cwd = MEMORY_HOME, glob?: string): string[] {
+	const root = path.resolve(cwd, target || ".");
+	const files: string[] = [];
+	let visited = 0;
+	function walk(candidate: string) {
+		if (++visited > 20_000) throw new Error("搜索范围过大，请指定更小的目录");
+		if (!isReadableMemoryPath(candidate, cwd)) return;
+		const stat = fs.lstatSync(candidate);
+		if (stat.isSymbolicLink()) return;
+		if (stat.isDirectory()) {
+			for (const name of fs.readdirSync(candidate)) walk(path.join(candidate, name));
+		} else if (stat.isFile() && stat.nlink === 1 && (!glob || path.matchesGlob(path.relative(root, candidate) || path.basename(candidate), glob))) files.push(candidate);
+	}
+	walk(root);
+	return files;
 }
 
 function realpathOrSelf(target: string): string {
@@ -96,4 +146,3 @@ export const DANGEROUS_BASH = [
 	/>\s*\/dev\/(disk|rdisk)/,
 	/\b(shutdown|reboot|halt)\b/,
 ];
-

@@ -34,6 +34,22 @@ async function waitFor<T>(predicate: () => T | undefined | false, timeoutMs = 15
 	}
 }
 
+// A Unix socket inode can exist before listen is ready (or remain from an old
+// process). Readiness requires an actual response, especially during restart.
+async function waitForKernel(socketPath: string): Promise<void> {
+	const deadline = Date.now() + 15_000;
+	for (;;) {
+		try {
+			const response = await rpcCall(socketPath, { id: "ready", type: "query.status" }, 1000) as { ok: boolean };
+			assert.equal(response.ok, true);
+			return;
+		} catch (error) {
+			if (!["ENOENT", "ECONNREFUSED"].includes((error as NodeJS.ErrnoException).code ?? "") || Date.now() >= deadline) throw error;
+		}
+		await new Promise(resolve => setTimeout(resolve, 30));
+	}
+}
+
 type Fixture = { home: string; socketPath: string; before: { mailbox: string; thoughts: string }; mailboxPath: string };
 
 function makeFixture(name: string): Fixture {
@@ -84,7 +100,7 @@ test("冒烟：导入 → 开门 → 指令 → 投影（旧内容逐字节不�
 	const fixture = makeFixture("main-smoke");
 	const { child, logs } = launch(fixture);
 	try {
-		await waitFor(() => fs.existsSync(fixture.socketPath), 15_000, "socket 出现");
+		await waitForKernel(fixture.socketPath);
 
 		const snapshot = (await rpcCall(fixture.socketPath, { id: "s1", type: "query.snapshot" })) as {
 			ok: boolean;
@@ -153,7 +169,7 @@ test("冒烟：暂停与继续（把它安静下来是用户的权力）", async
 	const fixture = makeFixture("main-pause");
 	const { child } = launch(fixture);
 	try {
-		await waitFor(() => fs.existsSync(fixture.socketPath), 15_000, "内核就绪");
+		await waitForKernel(fixture.socketPath);
 
 		const paused = (await rpcCall(fixture.socketPath, {
 			id: "p1",
@@ -215,7 +231,7 @@ test("首次运行报告：模型配置只看键在不在，绝不泄漏值", as
 	const fixture = makeFixture("main-setup");
 	const { child } = launch(fixture);
 	try {
-		await waitFor(() => fs.existsSync(fixture.socketPath), 15_000, "内核就绪");
+		await waitForKernel(fixture.socketPath);
 
 		const before = (await rpcCall(fixture.socketPath, { id: "s1", type: "query.snapshot" })) as {
 			result: { setup: Record<string, unknown> };
@@ -248,7 +264,7 @@ test("首次运行报告：模型配置只看键在不在，绝不泄漏值", as
 
 	const second = launch(fixture);
 	try {
-		await waitFor(() => fs.existsSync(fixture.socketPath), 15_000, "内核二次就绪");
+		await waitForKernel(fixture.socketPath);
 		const after = (await rpcCall(fixture.socketPath, { id: "s2", type: "query.snapshot" })) as {
 			result: { setup: Record<string, unknown> };
 		};
@@ -265,7 +281,7 @@ test("冒烟：重启后不丢、不重，且锁能接管", async () => {
 	const fixture = makeFixture("main-restart");
 	const first = launch(fixture);
 	try {
-		await waitFor(() => fs.existsSync(fixture.socketPath), 15_000, "首次启动");
+		await waitForKernel(fixture.socketPath);
 		await rpcCall(fixture.socketPath, {
 			id: "r1",
 			type: "command",
@@ -277,7 +293,7 @@ test("冒烟：重启后不丢、不重，且锁能接管", async () => {
 
 	const second = launch(fixture);
 	try {
-		await waitFor(() => fs.existsSync(fixture.socketPath), 15_000, "二次启动");
+		await waitForKernel(fixture.socketPath);
 		const status = (await rpcCall(fixture.socketPath, { id: "s3", type: "query.status" })) as {
 			ok: boolean;
 			result: { messages: Array<{ text: string }>; failures: string[] };
@@ -307,9 +323,9 @@ test("显式叫醒越过安静时段：用户的意图高于日程，自动呼�
 	// start = 当前小时、end = 当前小时 - 1 ⇒ 任何时刻跑都是安静的。
 	const quietStart = currentHour;
 	const quietEnd = (currentHour + 23) % 24;
-	const { child } = launch(fixture, { SPRITE_QUIET_START: String(quietStart), SPRITE_QUIET_END: String(quietEnd) });
+	const { child, logs } = launch(fixture, { SPRITE_NO_PI: "0", SPRITE_PI_BIN: path.resolve("core/__test__/review-pi.mjs"), SPRITE_QUIET_START: String(quietStart), SPRITE_QUIET_END: String(quietEnd) });
 	try {
-		await waitFor(() => fs.existsSync(fixture.socketPath), 15_000, "socket 出现");
+		await waitFor(() => logs.join("").includes("[core] 就绪"), 15_000, "内核完成监听并就绪");
 
 		// 留言：安静时段里必须**推迟**（如实入库，不吵醒它）
 		const message = (await rpcCall(fixture.socketPath, {
@@ -336,10 +352,13 @@ test("显式叫醒越过安静时段：用户的意图高于日程，自动呼�
 					.filter((name) => name.endsWith(".jsonl"))
 					.some((name) => {
 						const text = fs.readFileSync(path.join(fixture.home, "journal", name), "utf8");
-						return text.includes('"trigger":"wake"') && text.includes('"quiet":true');
+						return text.trim().split("\n").some(line => {
+							const event = JSON.parse(line);
+							return event.type === "run.started" && event.data.trigger === "wake" && event.data.quiet === false;
+						});
 					}),
 			8000,
-			"run.started(trigger=wake, quiet=true)",
+			"run.started(trigger=wake, quiet=false)",
 		);
 	} finally {
 		await stop(child);

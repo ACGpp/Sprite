@@ -95,17 +95,18 @@ fi
 
 echo ""
 echo "  $(t "让它在你的 Mac 上醒来。" "Wake it up on your Mac.")"
-echo "  $(t "记忆只留在这台机器：" "Memory stays on this machine: ")$HOME_DIR"
+echo "  $(t "记忆存储位置：" "Memory storage: ")$HOME_DIR"
 echo ""
 
 # ─── 1. 依赖 ───
-command -v node >/dev/null 2>&1 || die "没找到 node。装一个再来：https://nodejs.org（需要 22 以上）"
+command -v node >/dev/null 2>&1 || die "没找到 node。装一个再来：https://nodejs.org（推荐 24 LTS，最低 22.18）"
 NODE_BIN="$(command -v node)"
-NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]')"
-if [ "$NODE_MAJOR" -lt 22 ]; then die "node 版本太旧（$("$NODE_BIN" -v)）。内核用 Node 原生跑 TypeScript，需要 22 以上。"; fi
+if ! "$NODE_BIN" -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit((major === 22 && minor >= 18) || major >= 24 ? 0 : 1)'; then
+    die "node 版本不支持（$("$NODE_BIN" -v)）。内核直接运行 TypeScript，需要 Node 22.18+（22.x）或 24+；推荐 24 LTS。"
+fi
 say "node ✓ $("$NODE_BIN" -v)"
 
-command -v pi >/dev/null 2>&1 || die "没找到 pi（思考引擎）。先装：npm install -g @mariozechner/pi-coding-agent"
+command -v pi >/dev/null 2>&1 || die "没找到 pi（思考引擎）。先装：npm install -g @mariozechner/pi-coding-agent@0.70.2"
 say "pi ✓ $(command -v pi)"
 
 command -v swift >/dev/null 2>&1 || die "没找到 swift。装 Xcode 命令行工具：xcode-select --install"
@@ -116,6 +117,27 @@ say "编译 Sprite.app（第一次要一两分钟）…" "Building Sprite.app (a
 "$REPO_DIR/Scripts/build-app.sh" release >/dev/null || die "编译失败。单独跑 Scripts/build-app.sh release 看错误。"
 APP_SOURCE="$REPO_DIR/dist-shell/Sprite.app"
 [ -d "$APP_SOURCE" ] || die "编译产物不在：$APP_SOURCE"
+
+# Stop the old runtime before replacing files it may load on the next daily
+# session. A live old kernel plus a new pi extension is not a supported version.
+if [ "$MODE" != "no-service" ]; then
+	launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null || true
+fi
+"$NODE_BIN" --input-type=module - "$HOME_DIR/journal/journal.lock" <<'STOPPED' || die "旧内核仍在运行，未替换应用或内核文件。请先停止手动启动的内核再重试。" "The old kernel is still running; no app or kernel files were replaced. Stop the manually started kernel and retry."
+import fs from "node:fs";
+const lock = process.argv[2];
+const deadline = Date.now() + 15000;
+while (true) {
+  let pid;
+  try { pid = Number(fs.readFileSync(lock, "utf8").trim()); }
+  catch (error) { if (error.code === "ENOENT") process.exit(0); throw error; }
+  if (!Number.isSafeInteger(pid) || pid <= 0) process.exit(1);
+  try { process.kill(pid, 0); }
+  catch (error) { if (error.code === "ESRCH") process.exit(0); throw error; }
+  if (Date.now() >= deadline) process.exit(1);
+  await new Promise(resolve => setTimeout(resolve, 100));
+}
+STOPPED
 
 TARGET_DIR="/Applications"
 if [ ! -w "$TARGET_DIR" ]; then TARGET_DIR="$HOME/Applications"; fi
@@ -184,12 +206,26 @@ PLIST
 	[ -n "$loaded" ] || die "launchd 加载失败。看 $LOG_DIR/sprite-core.err.log"
 	launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null || true
 	# **装完必须验证内核真的在跑**：加载成功不等于内核起来了（这正是刚才踩的坑）
-	started=""
-	for _ in $(seq 1 30); do
-		if [ -S "$HOME_DIR/runtime/core.sock" ]; then started="yes"; break; fi
-		sleep 0.5
-	done
-	[ -n "$started" ] || die "服务加载了但内核没起来。看 $LOG_DIR/sprite-core.err.log"
+	# A first upgrade may replay legacy projections. Wait for an actual RPC reply,
+	# not a leftover socket inode, and give durable migration time to finish.
+	"$NODE_BIN" --input-type=module - "$HOME_DIR/runtime/core.sock" <<'READY' || die "服务加载了但内核未能就绪。看 $LOG_DIR/sprite-core.err.log"
+import net from "node:net";
+const socketPath = process.argv[2];
+const deadline = Date.now() + 180000;
+while (Date.now() < deadline) {
+  const ready = await new Promise(resolve => {
+    const socket = net.connect(socketPath); let data = ""; let done = false;
+    const finish = value => { if (done) return; done = true; socket.destroy(); resolve(value); };
+    socket.setTimeout(2000, () => finish(false));
+    socket.on("error", () => finish(false));
+    socket.on("connect", () => socket.write(JSON.stringify({id:"install-ready",type:"query.diagnostics"}) + "\n"));
+    socket.on("data", chunk => { data += chunk; if (!data.includes("\n")) return; try { const reply=JSON.parse(data.split("\n")[0]); finish(reply.ok === true && Number.isInteger(reply.result?.pid)); } catch { finish(false); } });
+  });
+  if (ready) process.exit(0);
+  await new Promise(resolve => setTimeout(resolve, 500));
+}
+process.exit(1);
+READY
 	say "内核常驻服务已加载并且在跑（崩溃会自动拉起，日志：$LOG_DIR/sprite-core.log)" "The kernel service is loaded and running (it restarts on crash; log: $LOG_DIR/sprite-core.log)"
 fi
 

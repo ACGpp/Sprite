@@ -41,7 +41,7 @@ TEXT_EXT = (".ts", ".swift", ".md", ".json", ".mjs", ".js", ".sh", ".yml", ".yam
 
 
 def git(*args) -> str:
-    out = subprocess.run(["git", "-C", REPO, *args], capture_output=True)
+    out = subprocess.run(["git", "-C", REPO, *args], capture_output=True, check=True)
     return out.stdout.decode("utf-8", "replace")
 
 
@@ -136,7 +136,7 @@ if os.path.exists(allow_path):
 tracked = [name for name in git("ls-tree", "-r", "--name-only", REF).splitlines() if name]
 targets = [name for name in tracked if name.endswith(TEXT_EXT)]
 print(f"目标：{REF} 的 {len(targets)} 个文本文件")
-print(f"探针：真实密钥 {len(secrets)} 条、身份名 {len(identity_names)} 个（{'、'.join(sorted(identity_names)) or '无'}）、记忆 {memory_files} 个文件 / {len(grams)} 个 {N}-gram")
+print(f"探针：真实密钥 {len(secrets)} 条、身份名 {len(identity_names)} 个、记忆 {memory_files} 个文件 / {len(grams)} 个 {N}-gram")
 print(f"白名单：{len(allowlist)} 条（Scripts/privacy-allowlist.txt）")
 print()
 

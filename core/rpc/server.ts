@@ -20,13 +20,15 @@ export type RpcHandlers = {
 	/** 进程级诊断（内存、运行时长、日志体积）——长跑泄漏只能靠它观察 */
 	diagnostics?(): unknown;
 	/** 只读记录：日记 / 探索笔记 / 对话 / 思维流（外壳不读文件，由内核交出来） */
-	records?(kind: string, limit: number): unknown;
+	records?(kind: string, limit: number, beforeDate?: string): unknown;
 	/** 只读文档：记录里的一篇正文 */
 	document?(relativePath: string): unknown;
 	/** 读回一段录音（base64）——外壳不碰记忆目录，播放必须经由内核 */
 	audio?(relativePath: string): unknown;
 	/** 界面可改的设置（不含密钥值） */
 	settings?(): unknown;
+	/** User-facing memory history, restore and agreements; never an Agent gateway action. */
+	memoryManage?(request: Record<string, unknown>): unknown;
 	/** 某家供应商能用哪些模型（问 pi 要，界面给下拉，省得用户猜模型名） */
 	models?(provider: string): unknown;
 	snapshot(): unknown;
@@ -90,6 +92,12 @@ export function createRpcServer(options: {
 		}
 
 		switch (request.type) {
+			case "memory.manage":
+				safeSend(socket, id, "memory.manage", () => {
+					if (!handlers.memoryManage) throw new Error("内核不支持记忆管理");
+					return handlers.memoryManage({ ...request, kind: "memory.manage" });
+				});
+				return;
 			case "query.status":
 				safeSend(socket, id, "query.status", () => handlers.status());
 				return;
@@ -102,7 +110,7 @@ export function createRpcServer(options: {
 					return;
 				}
 				safeSend(socket, id, "query.records", () =>
-					handlers.records?.(String(request.kind ?? "diary"), Number(request.limit ?? 50)),
+					handlers.records?.(String(request.kind ?? "diary"), Number(request.limit ?? 50), typeof request.beforeDate === "string" ? request.beforeDate : undefined),
 				);
 				return;
 			case "query.models":

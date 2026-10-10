@@ -41,11 +41,19 @@ import { execFile } from "node:child_process";
 import { importLegacy, ownershipHandoffEvent, type ImportReport } from "./importer.ts";
 import { openJournal, type Journal } from "./journal.ts";
 import { createProjector } from "./projector.ts";
+import { queryConversationRecords, readJournalEvents } from "./record-store.ts";
+import { recoverLegacyAnswers } from "./command-recovery.ts";
 import { createRpcServer, type RpcServer } from "./rpc/server.ts";
 import { createGatewayServer } from "./rpc/gateway.ts";
 import { clampInterval, createScheduler, type Pause, type QuietHours } from "./scheduler.ts";
 import { createStateTracker, deriveState } from "./state.ts";
 import { truncate } from "./text.ts";
+import { memoryCapabilities, ORDINARY_MEMORY_DIRS, ORDINARY_MEMORY_FILES, SPRITE_SYSTEM_PROMPT } from "../contracts/memory-policy.ts";
+import { createMemoryStore, type MemoryProposal } from "./memory-store.ts";
+import { createMemoryManagement } from "./memory-management.ts";
+import { buildMemoryContext, MemoryContextError } from "./memory-context.ts";
+import { queryMemoryHistory } from "./memory-history.ts";
+import { isReadableMemoryPath } from "../pi-extension/policy.ts";
 
 export type KernelConfig = {
 	/** 记忆之家。产品默认 ~/.claude-memory；测试可指向夹具目录。 */
@@ -56,9 +64,11 @@ export type KernelConfig = {
 	piBin?: string;
 	piArgs?: string[];
 	piEnv?: Record<string, string>;
+	/** Explicit trusted extensions (e.g. offline provider fixtures); automatic discovery is disabled. */
+	piExtensions?: string[];
 	/** 能力网关扩展路径（agent 的手与门）。 */
 	gatewayExtension?: string;
-	/** 写操作的允许根目录（默认只有记忆之家）。 */
+	/** 旧接口兼容字段。记忆写入的实际允许范围由统一 memory-policy 固定，不能据此扩大。 */
 	allowedRoots?: string[];
 	/** 测试/只读场景：不启动 pi，仅提供数据与指令面。 */
 	disableAgent?: boolean;
@@ -98,6 +108,8 @@ export type Kernel = {
 	status(): unknown;
 	snapshot(): unknown;
 	stop(): void;
+	/** CLI 退出前等待 Agent 及其工具子进程停止。 */
+	shutdown(): Promise<void>;
 	/** 跑一拍并返回结果（测试与 CLI 用；正常运行由调度器触发）。 */
 	breathNow(trigger?: "manual" | "timer"): Promise<unknown>;
 };
@@ -131,7 +143,7 @@ function inspectSetup(
 }
 
 function resolveDefaults(config: KernelConfig) {
-	const homeDir = config.homeDir ?? path.join(os.homedir(), ".claude-memory");
+	const homeDir = path.resolve(config.homeDir ?? path.join(os.homedir(), ".claude-memory"));
 	const runtimeDir = path.join(homeDir, "runtime");
 	return {
 		homeDir,
@@ -153,6 +165,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 	let rpc: RpcServer | null = null;
 	let projector: ReturnType<typeof createProjector> | null = null;
 	let projectWatermark = 0;
+	let projectionNeedsReplay = false;
 	const handedOff = new Set<string>();
 
 	// 读模型增量维护：每次查询重放全量事件是 O(n)，实测 20 万条时单次要 1.4 秒。
@@ -184,8 +197,14 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			}
 			// 只投影"新内容"：导入水位线之前的事件来自文件本身，写回去就是自我复制
 			if (projector && event.seq > projectWatermark && projector.supported(event.type)) {
+				if (projectionNeedsReplay) {
+					const results = projector.recover(readJournalEvents(homeDir));
+					projectionNeedsReplay = results.some(result => !result.ok);
+					if (projectionNeedsReplay) return;
+				}
 				const result = projector.project(event);
 				if (!result.ok) {
+					projectionNeedsReplay = true;
 					journal.append("system.problem", {
 						code: "projection.failed",
 						userMessage: "记忆产物写入失败，事实已保存在事件日志中。",
@@ -210,23 +229,58 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 		`[core] 导入：${imported.length > 0 ? imported.map((r) => `${r.source}+${r.events}`).join(" ") : "无新内容"}（水位线 seq=${projectWatermark}）`,
 	);
 
-	const companionName = config.companionName ?? readCompanionName(homeDir);
+	let companionName = config.companionName ?? readCompanionName(homeDir);
+	function refreshCompanionName() {
+		const next = config.companionName ?? readCompanionName(homeDir);
+		if (next !== companionName) {
+			companionName = next;
+			journal.append("identity.changed", { companionName });
+		}
+		return companionName;
+	}
 	log(`[core] 它的名字：${companionName}`);
-	projector = createProjector({ homeDir, companionName, fsync, log });
+	recoverLegacyAnswers(journal, readJournalEvents(homeDir));
+	projector = createProjector({ homeDir, companionName, currentCompanionName: () => companionName, fsync, log });
+	const restoredFiles = new Set<string>();
+	function* projectionHistory() {
+		for (const event of readJournalEvents(homeDir)) {
+			if (projector!.supported(event.type)) {
+				const file = event.type === "thought.recorded" ? "thoughts/stream.jsonl" : "conversations/mailbox.md";
+				if (event.data.importSource === undefined || !fs.existsSync(path.join(homeDir, file))) restoredFiles.add(file);
+			}
+			yield event;
+		}
+	}
+	for (const result of projector.recover(projectionHistory())) {
+		if (!result.ok) {
+			projectionNeedsReplay = true;
+			journal.append("system.problem", { code: "projection.recovery", userMessage: "记录投影恢复失败，原始日志仍保留", detail: result.error });
+		}
+	}
+	if (!projectionNeedsReplay) {
+		for (const file of restoredFiles) {
+			if (journal.hasOwnershipHandoff(file)) continue;
+			handedOff.add(file);
+			const marker = ownershipHandoffEvent(file);
+			journal.append(marker.type, marker.data);
+		}
+	}
 
 	// ─── 2. 崩溃恢复：先收尾被打断的 run，再开门 ───
 	const recovered = tracker.state;
 	if (recovered.danglingRun) {
-		journal.append("run.failed", { reason: "core restarted", runId: `orphan-${recovered.lastRunStartSeq}` });
+		for (const runId of Object.keys(recovered.claimedRuns)) {
+			journal.append("run.failed", { reason: "core restarted", runId, outcomeUnknown: true });
+		}
 		log("[core] 检测到被中断的呼吸，已标记 run.failed（不重复执行）");
 	}
 
 	// ─── 3. 常驻 pi ───
 	// 模型配置来自 config/settings.json（由界面或 setup 维护）。
-	// 密钥只进子进程参数，绝不进日志/读模型/界面。
+	// 密钥通过子进程环境注入，绝不进日志/读模型/界面。
 	let settings: Settings = readSettings(homeDir);
 	if (!config.piArgs) log(`[core] 模型配置：${describeSettings(settings)}`);
-	if (settings.security.agentShell !== "on") log(`[core] 手脚档位：${settings.security.agentShell}（bash${settings.security.agentShell === "off" ? " 与文件读写都不可用" : " 不可用，文件只读"}）`);
+	if (settings.security.agentShell !== "on" && settings.security.agentShell !== "full") log(`[core] 手脚档位：${settings.security.agentShell}（bash${settings.security.agentShell === "off" ? " 与文件读写都不可用" : " 不可用，文件只读"}）`);
 
 	// 安静时段优先级：显式配置（环境/代码）> 界面里填的设置 > 内置默认（23–7）
 	const configuredQuiet = config.quietHours;
@@ -348,10 +402,20 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 	let todayActivity: TodayActivity = { day: dayInShanghai(new Date()), wakes: 0, actions: 0, writes: 0, reads: 0, said: 0 };
 	/** 连续多少拍醒来后一个动作都没有（界面据此提示"它连续空转"）。 */
 	let idleStreak = 0;
+	let activityRun: { id: string; substantive: number } | null = null;
+	function emptyTodayActivity(day: string): TodayActivity {
+		return { day, wakes: 0, actions: 0, writes: 0, reads: 0, said: 0 };
+	}
+	/** 常驻进程跨上海日后，首个 prompt 也必须看到新一天的读数。 */
+	function ensureTodayActivityDay(day = dayInShanghai(new Date())): void {
+		if (day === todayActivity.day) return;
+		todayActivity = emptyTodayActivity(day);
+		idleStreak = 0;
+	}
 
 	/** 启动时先把今天已有的事件数进来（重启不该让读数归零）。 */
 	function seedTodayActivity(): void {
-		todayActivity = { day: dayInShanghai(new Date()), wakes: 0, actions: 0, writes: 0, reads: 0, said: 0 };
+		todayActivity = emptyTodayActivity(dayInShanghai(new Date()));
 		const file = path.join(homeDir, "journal", `${todayActivity.day}.jsonl`);
 		let raw = "";
 		try {
@@ -362,7 +426,10 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 		for (const line of raw.split("\n")) {
 			if (!line.trim()) continue;
 			try {
-				countActivity(JSON.parse(line) as JournalEvent);
+				const event = JSON.parse(line) as JournalEvent;
+				// 文件名是索引提示，不是真相；旧文件可能包含跨日或错名事件。
+				// 启动时只把事件自身的上海日计入“今天”，避免把旧日快照带进来。
+				if (dayInShanghai(new Date(event.at)) === todayActivity.day) countActivity(event);
 			} catch {
 				// 半行跳过
 			}
@@ -372,25 +439,31 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 	/** 只数事实，不做评价。 */
 	function countActivity(event: JournalEvent): void {
 		const day = dayInShanghai(new Date(event.at));
-		if (day !== todayActivity.day) todayActivity.day = day, (todayActivity = { day, wakes: 0, actions: 0, writes: 0, reads: 0, said: 0 });
+		ensureTodayActivityDay(day);
 		const data = event.data as Record<string, unknown>;
 		switch (event.type) {
 			case "run.started":
 				todayActivity.wakes += 1;
+				activityRun = { id: String(data.runId ?? ""), substantive: 0 };
 				break;
 			case "run.activity": {
 				todayActivity.actions += 1;
 				const tool = String(data.tool ?? "");
-				if (tool === "write" || tool === "edit") todayActivity.writes += 1;
+				if (tool !== "set_next_breath" && activityRun && activityRun.id === data.runId) activityRun.substantive += 1;
 				if (tool === "read" || tool === "ls" || tool === "grep" || tool === "glob" || tool === "find") todayActivity.reads += 1;
 				break;
 			}
+			case "tool.finished":
+				if ((data.tool === "write" || data.tool === "edit") && data.success === true && data.verified === true) todayActivity.writes += 1;
+				break;
 			case "message.out":
 				todayActivity.said += 1;
 				break;
 			case "run.finished": {
 				// 空手而归的醒来会累加；做了事就清零（连续空转是界面要提示的那件事）
-				idleStreak = Number(data.activities ?? 0) > 0 ? 0 : idleStreak + 1;
+				const substantive = data.substantiveActivities ?? (activityRun && activityRun.id === data.runId ? activityRun.substantive : data.activities);
+				idleStreak = Number(substantive ?? 0) > 0 ? 0 : idleStreak + 1;
+				activityRun = null;
 				break;
 			}
 			default:
@@ -399,6 +472,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 	}
 
 	function activityFacts(): { today: TodayActivity; idleStreak: number } {
+		ensureTodayActivityDay();
 		return { today: { ...todayActivity }, idleStreak };
 	}
 
@@ -406,6 +480,9 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 	seedTodayActivity(); // 计数器声明之后才能 seeding（今天已有的事件要先数进来）
 	let timer: NodeJS.Timeout | null = null;
 	let waking = false;
+	let queuedTrigger: "message" | "wake" | null = null;
+	let activeGeneration: string | null = null;
+	let replacement: Promise<void> | null = null;
 	let stopped = false;
 	/** 换模型时会主动重启 pi：这期间的退出不算"意外崩溃" */
 	let restartingAgent = false;
@@ -436,8 +513,10 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 	 */
 	const allowedRoots =
 		config.allowedRoots ??
-		["diary", "explorations", "notes", "private", "context"].map((name) => path.join(homeDir, name));
-	const sessionDir = path.join(homeDir, "sessions");
+		[...ORDINARY_MEMORY_DIRS, ...ORDINARY_MEMORY_FILES].map((name) => path.join(homeDir, name));
+	// A new namespace leaves old prompts/compaction summaries intact without reloading stale memory instructions.
+	const sessionDir = path.join(homeDir, "sessions", "memory-v1");
+	let sessionDay: string | null = null;
 	const customExtensionPath = path.join(homeDir, "config", "custom-provider.ts");
 	fs.mkdirSync(sessionDir, { recursive: true });
 
@@ -450,16 +529,17 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 		return customExtensionPath;
 	}
 
-	function agentArgs(): string[] {
+	function agentArgs(day: string): string[] {
 		if (config.piArgs) return config.piArgs;
-		const args = ["--mode", "rpc", ...piArgsFor(settings), "-e", gatewayExtension];
-		// 可选边界：on 用 pi 的默认工具集（含 bash）；readonly / off 明确收窄
+		const args = ["--mode", "rpc", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-extensions", "--system-prompt", SPRITE_SYSTEM_PROMPT, "--append-system-prompt", " ", ...piArgsFor(settings), "-e", gatewayExtension];
+		for (const extension of config.piExtensions ?? []) args.push("-e", extension);
+		// 工具集与内核鉴权共享同一策略；仅明确启用 full 时开放 pi 的 bash。
 		const tools = allowedToolsFor(settings.security.agentShell);
 		if (tools) args.push("--tools", tools.join(","));
 		const custom = writeCustomProvider();
 		if (custom) args.push("-e", custom);
-		// 每天一个 session，与 v1 的 sessions/YYYY-MM-DD.jsonl 完全兼容
-		args.push("--session", path.join(sessionDir, `${new Date().toISOString().slice(0, 10)}.jsonl`));
+		// 每上海日一个 session；memory-v1 命名空间保留旧原件但不重载旧记忆快照。
+		args.push("--session", path.join(sessionDir, `${day}.jsonl`));
 		return args;
 	}
 
@@ -475,19 +555,31 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 		// 换模型时会主动杀旧引擎：它的退出**晚到**也绝不能报成"意外崩溃"。
 		// 靠时间差（restartingAgent 标志）不够——退出事件可能在新引擎起来之后才到，
 		// 所以这里认**身份**：只有当前这个实例的退出才算数。
+		const day = dayInShanghai(new Date());
+		const generation = crypto.randomUUID();
+		activeGeneration = generation;
+		const keyEnv = settings.model.mode === "custom" ? CUSTOM_KEY_ENV : PROVIDER_KEY_ENV[settings.model.provider ?? ""];
+		// pi also discovers settings/models/auth, beyond extensions and prompt files.
+		// Keep its cwd and default agentDir in kernel-owned runtime, outside authored memory.
+		const piWorkspace = path.join(runtimeDir, "pi-workspace");
+		fs.mkdirSync(piWorkspace, { recursive: true, mode: 0o700 });
 		const instance = createPiRpc({
 			bin: piBin,
-			args: agentArgs(),
+			args: agentArgs(day),
 			env: {
 				SPRITE_GATEWAY_SOCK: gatewaySocketPath,
 				SPRITE_ALLOWED_ROOTS: allowedRoots.join(":"),
 				// 自定义端点的密钥走环境变量：**不落文件、不进日志**
-				...(settings.model.mode === "custom" && settings.model.apiKey ? { [CUSTOM_KEY_ENV]: settings.model.apiKey } : {}),
 				...(config.piEnv ?? {}),
+				PI_CODING_AGENT_DIR: path.join(runtimeDir, "pi-agent"),
+				SPRITE_MEMORY_HOME: homeDir,
+				...(keyEnv && settings.model.apiKey ? { [keyEnv]: settings.model.apiKey } : {}),
+				SPRITE_AGENT_GENERATION: generation,
+				SPRITE_AGENT_SHELL: settings.security.agentShell,
 			},
-			cwd: homeDir,
+			cwd: piWorkspace,
 			onExit: ({ code, signal }) => {
-				if (stopped || restartingAgent || pi !== instance) return;
+				if (stopped || restartingAgent || pi !== instance || breath?.retired) return;
 				journal.append("system.problem", {
 					code: "pi.exited",
 					userMessage: "思考引擎意外退出，它暂时不能自主呼吸。",
@@ -497,13 +589,16 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 				journal.append("presence.changed", { state: "degraded" });
 			},
 		});
-		instance.start();
 		pi = instance;
+		sessionDay = day;
 		breath = createBreathRunner({
 			journal,
 			pi: instance,
-			isQuiet: () => scheduler.isQuiet(),
+			getState: () => tracker.state,
+			isQuiet: () => currentTrigger !== "wake" && scheduler.isQuiet(),
+			sanitizeError: text => settings.model.apiKey ? text.split(settings.model.apiKey).join("[redacted]") : text,
 			observationExtras: () => {
+				ensureTodayActivityDay();
 				const state = tracker.state;
 				const pending = state.pendingMessages.length;
 				// 安静时段收着的话：安静刚结束的那一拍要把它们交回去（M7 的兑现机制）
@@ -536,9 +631,8 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 					proactivePerDay: proactive.perDay,
 					nudge,
 					heldBack,
-					// 工作视野：工作记忆 + 操作件（可驱逐、可回读，永不替换）
-					workingMemory: readViewFile("working-memory.md"),
-					constraints: readViewFile("constraints.md"),
+					// Mutable memory is injected transiently by pi's context hook, never
+					// persisted as old instructions in every breath's session message.
 					// 只补事实：它自己有什么、记忆里有什么、上次和今天做过什么。
 					// 要不要做事仍然是它的选择（用户选的产品方向 A）。
 					facts: {
@@ -552,12 +646,31 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			},
 			log,
 		});
+		// Register the runner before starting the process, keeping ownership explicit.
+		instance.start();
 	}
 
-	function stopAgent(): void {
-		breath = null;
-		pi?.stop();
-		pi = null;
+	/** 配置改变先撤销旧世代的入口，再确认旧运行和进程停止。并发保存共享替换操作。 */
+	async function replaceAgent(reason: string): Promise<void> {
+		if (replacement) return replacement;
+		restartingAgent = true;
+		activeGeneration = null;
+		const previousRunner = breath;
+		const previousPi = pi;
+		replacement = (async () => {
+			try {
+				await previousRunner?.cancel(reason);
+				await previousPi?.terminate();
+				if (stopped) return;
+				breath = null;
+				pi = null;
+				startAgent();
+			} finally {
+				restartingAgent = false;
+				replacement = null;
+			}
+		})();
+		return replacement;
 	}
 
 	startAgent();
@@ -571,7 +684,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			if (dayInShanghai(new Date(event.at)) !== today) continue;
 			if (event.data.channel !== "bubble") continue;
 			const origin = typeof event.data.origin === "string" ? event.data.origin : "message";
-			if (origin === "message" || origin === "recovered-queue") continue;
+			if (origin === "message" || origin === "recovered-queue" || origin === "wake") continue;
 			count += 1;
 		}
 		return count;
@@ -593,36 +706,10 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 	 * 产品决定 A（只补事实）：告诉它有什么，但不命令它去用。
 	 */
 	function capabilitiesFact(): string {
-		const roots = allowedRoots.map((root) => `${path.relative(homeDir, root) || root}/`).join(" ");
-		switch (settings.security.agentShell) {
-			case "off":
-				return "你的手脚：现在只能说话、留话、定闹钟、提问——碰不到文件，也不能跑命令。";
-			case "readonly":
-				return `你的手脚：能读能搜 ${roots}，但不能写文件、不能跑命令。`;
-			default:
-				return `你的手脚：能读写 ${roots}，也能跑命令（命令不是沙箱；写东西请只写这些目录）。`;
-		}
+		return memoryCapabilities(settings.security.agentShell) + (settings.security.agentShell === "full"
+			? ` bash 的默认工作目录是 ${path.join(runtimeDir, "pi-workspace")}；记忆之家是 ${homeDir}。可自行选择其他工作目录。` : "");
 	}
 
-	/**
-	 * 读一个"工作视野"里的文本文件（工作记忆 / 操作件）。
-	 *
-	 * 口径：这两份是**可以驱逐出视野**的东西，但**不允许被替换**——
-	 * 文件是本地的、只读进来；超长只截开头，并明确告诉它自己去读完整版。
-	 */
-	const VIEW_LIMIT = 3000;
-	function readViewFile(name: string): { path: string; text: string; truncated: boolean } | undefined {
-		const relative = `context/${name}`;
-		let raw = "";
-		try {
-			raw = fs.readFileSync(path.join(homeDir, relative), "utf8");
-		} catch {
-			return undefined; // 没有这个文件就不放这一块（不编造空文件）
-		}
-		const text = raw.trim();
-		if (text.length <= VIEW_LIMIT) return { path: relative, text, truncated: false };
-		return { path: relative, text: text.slice(0, VIEW_LIMIT), truncated: true };
-	}
 
 	/** 它的记忆现状：只报事实（篇数、最近一篇多久以前）。 */
 	function memoryFact(): string {
@@ -645,9 +732,8 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 		};
 		const diary = filesIn("diary");
 		const diaryNewest = newestMs("diary");
-		const days = diaryNewest === null ? null : Math.floor((Date.now() - diaryNewest) / 86_400_000);
 		const parts = [`日记 ${diary.length} 篇`];
-		if (days !== null) parts.push(days <= 0 ? "最近一篇是今天写的" : `最近一篇是 ${days} 天前写的`);
+		if (diaryNewest !== null) parts.push(`最近修改于 ${dayInShanghai(new Date(diaryNewest))}（上海日期；修改不等于首次写入）`);
 		parts.push(`探索笔记 ${filesIn("explorations").length} 篇`, `私人空间 ${filesIn("private").length} 篇`);
 		return `你的记忆：${parts.join("，")}。`;
 	}
@@ -685,27 +771,25 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 
 	/** 今天（上海日）做了什么——和界面上看到的是同一份读数 */
 	function todayFact(): string {
+		ensureTodayActivityDay();
 		const today = todayActivity;
 		return `今天（上海日）：醒来 ${today.wakes} 次，工具动作 ${today.actions} 次（写/改 ${today.writes}，读 ${today.reads}），说话 ${today.said} 次。`;
 	}
 
 	/** 上一次醒来做了什么（写/改文件才算"做了事"） */
 	function lastRunWriteSummary(): string | null {
-		const runs: number[] = [];
-		for (let index = journal.events.length - 1; index >= 0 && runs.length < 2; index -= 1) {
-			const event = journal.events[index];
-			if (event?.type === "run.started") runs.push(index);
-		}
-		const previous = runs[1];
-		if (previous === undefined) return null;
+		// Observation is built BEFORE the next run.started, so the latest start is
+		// the previous run. Never revive a successful write from an older run.
+		const previous = journal.events.findLastIndex(event => event.type === "run.started");
+		if (previous < 0) return null;
+		const runId = journal.events[previous]!.data.runId;
 		for (let index = previous + 1; index < journal.events.length; index += 1) {
 			const event = journal.events[index];
-			if (event?.type !== "run.activity") continue;
+			if (event?.type !== "tool.finished" || event.data.success !== true || event.data.verified !== true) continue;
+			if (event.data.runId !== runId) continue;
 			const tool = String(event.data.tool ?? "");
 			if (tool !== "write" && tool !== "edit") continue;
-			const summary = String(event.data.summary ?? "");
-			const match = /"file_path":"([^"]+)"/.exec(summary) ?? /"path":"([^"]+)"/.exec(summary);
-			return match ? match[1] : "一个文件";
+			return typeof event.data.path === "string" ? event.data.path : "一个文件";
 		}
 		return null;
 	}
@@ -727,10 +811,21 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 
 	async function runBreath(trigger: "timer" | "message" | "wake" | "recovered-queue" | "manual") {
 		if (stopped) return null;
+		if (replacement) { await replacement; return runBreath(trigger); }
+		if (stopped) return null;
+		if (pause?.until !== null && pause?.until !== undefined && pause.until <= Date.now()) {
+			pause = null;
+			journal.append("breath.resumed", { reason: "暂停期限已到" });
+		}
 		if (!breath) {
 			journal.append("run.failed", { reason: "pi 不可用，无法呼吸", trigger });
 			journal.append("presence.changed", { state: "degraded" });
 			return null;
+		}
+		if (breath.running) {
+			waking = true;
+			if (trigger === "wake" || queuedTrigger !== "wake") queuedTrigger = trigger === "wake" ? "wake" : "message";
+			return { runId: null, ok: false, busy: true, durationMs: 0, activities: 0, thought: null };
 		}
 		currentTrigger = trigger;
 		// 暂停中的定时拍：**直接跳过**，什么都不做。
@@ -742,14 +837,28 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			scheduleNext();
 			return { runId: null, ok: true, durationMs: 0, activities: 0, thought: null, reason: "paused" };
 		}
+		// One replacement per attempt, after pause handling. If the replacement
+		// fails too, the runner records it and normal backoff applies (no recursion).
+		if (!pi?.alive) {
+			await replaceAgent("思考引擎已退出");
+			if (stopped) return null;
+		}
+		// 常驻进程也要日切：在新一天的第一拍之前换 session。
+		// 正在进行的对话必须先完成；显式 piArgs（固定 session / --no-session）保持原语义。
+		if (!config.piArgs && !breath.running && sessionDay !== dayInShanghai(new Date())) {
+			await replaceAgent("上海日期切换");
+			return runBreath(trigger);
+		}
 		// 「这一拍是不是安静时段里跑的」必须在**开始**时判定：
 		// 一拍可能横跨安静时段的边界（实测：用户或设置在拍与拍之间翻转），
 		// 结束时再看就会把"安静的一拍"记成不安静——早上交回收着的话就失效了。
-		const quietAtStart = scheduler.isQuiet();
+		const scheduledQuietAtStart = scheduler.isQuiet();
+		const quietAtStart = trigger !== "wake" && scheduledQuietAtStart;
 		// 安静时段的起点也要在开始前记：这一拍期间它想说的话会被降级成 digest，
 		// 等结束才记的话那些话会落在窗口之外（M7 的内核级回归测试抓到的）。
 		if (quietAtStart && quietStartedAt === null) quietStartedAt = new Date().toISOString();
-		const outcome = await breath.run(trigger);
+		const runner = breath!;
+		const outcome = await runner.run(trigger);
 		// 被 busy 拒掉的那一拍**什么都没发生过**：安静簿记必须原封不动。
 		// （实测竞态：唤醒在安静那一拍飞行途中到达 → 被拒的唤醒把 quietStartedAt
 		// 抹成 null → 正在跑的那一拍收尾时"收着的话"已经找不到窗口，早上交不回去。）
@@ -757,12 +866,16 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			waking = true; // 由正在跑的那一拍结束后补跑
 			return outcome;
 		}
-		if (!quietAtStart) quietStartedAt = null;
-		lastBreathQuiet = quietAtStart;
+		if (!scheduledQuietAtStart) quietStartedAt = null;
+		lastBreathQuiet = scheduledQuietAtStart;
 		// 关停信号可能在 await 期间到达：此时日志已关闭，再写就是**未捕获异常**，
 		// 直接把进程崩掉（实测：SIGTERM 时正好有呼吸在跑 → 崩）。
 		// 收尾阶段允许写不进去，但不允许崩。
 		if (stopped) return outcome;
+		// 配置替换的旧轮次只完成自身记账，不得覆盖新实例的存在状态和排程。
+		if (runner !== breath || restartingAgent) return outcome;
+		currentTrigger = null;
+		if (runner.retired || !pi?.alive) await replaceAgent("运行结束后恢复引擎");
 		try {
 			consecutiveFailures = outcome.ok ? 0 : consecutiveFailures + 1;
 			// 暂停中（例如用户按了「安静一会儿」之后又被叫醒回了一句）：presence 必须如实是 paused。
@@ -775,11 +888,17 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			scheduleNext();
 			if (waking || pending > 0) {
 				waking = false;
+				const nextTrigger = queuedTrigger ?? "recovered-queue";
+				queuedTrigger = null;
 				// 只有**成功**的那一拍才配"马上补跑"（用户按了唤醒，或有没送到的话）。
 				// 失败时贴着重试会变成热循环：引擎整段拒绝（key 失效、provider 挂了）时
 				// 实测 50ms 一轮、连日志都被刷爆；而消息本来就不会丢——scheduleNext()
 				// 已经按指数退避（60s 起）排好下一拍，待处理队列在那一拍照常送出去。
-				if (outcome.ok) setTimeout(() => void runBreath("recovered-queue"), 50);
+				if (outcome.ok && (nextTrigger === "wake" || (!scheduler.activePause(pause) && !scheduler.isQuiet()))) {
+					setTimeout(() => {
+						if (nextTrigger === "wake" || (!scheduler.activePause(pause) && !scheduler.isQuiet())) void runBreath(nextTrigger);
+					}, 50);
+				}
 			}
 		} catch (error) {
 			log(`[core] 收尾时跳过一拍的后处理：${error instanceof Error ? error.message : String(error)}`);
@@ -787,13 +906,11 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 		return outcome;
 	}
 
-	/** 「今晚」= 下一个早上 7 点（安静时段的结束），本地时区。 */
+	/** 「今晚」= 上海日期的下一个安静时段结束时刻。 */
 	function nextMorning(): Date {
-		// 用**用户设的安静时段结束时刻**，不是硬编码的 7 点（他可能改成 8 点或 6 点）
 		const now = new Date();
-		const morning = new Date(now);
-		morning.setHours(scheduler.quietHours.end, 0, 0, 0);
-		if (morning.getTime() <= now.getTime()) morning.setDate(morning.getDate() + 1);
+		const morning = new Date(`${dayInShanghai(now)}T${String(scheduler.quietHours.end).padStart(2, "0")}:00:00+08:00`);
+		if (morning.getTime() <= now.getTime()) morning.setTime(morning.getTime() + 86_400_000);
 		return morning;
 	}
 
@@ -812,6 +929,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			if (timer) clearTimeout(timer);
 			journal.append("breath.paused", { until: pause.until, mode: parsed.until });
 			journal.append("presence.changed", { state: "paused" });
+			scheduleNext();
 			return { paused: true, until: pause.until, mode: parsed.until };
 		}
 		pause = null;
@@ -822,19 +940,118 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 	}
 
 	// ─── 4. 能力网关（agent 唯一的门） ───
+	const memory = createMemoryStore({ homeDir, fsync });
+	const memoryManagement = createMemoryManagement({ store: memory });
+	const proposalQuestionId = (id: string) => `memory:${id}`;
+	function publishProposal(item: MemoryProposal) {
+		const questionId = proposalQuestionId(item.id);
+		if (item.status !== "pending" || tracker.state.questions.some(q => q.questionId === questionId)) return;
+		journal.append("question.asked", { questionId, question: `修改 ${item.path}\n原因：${item.reason}\n\n修改前：\n${item.before ?? "（文件不存在）"}\n\n修改后：\n${item.after}\n\n仅批准这份具体修改；文件版本变化后必须重新确认。`, options: ["批准此修改", "拒绝此修改"] });
+	}
+	function recordProposalAnswer(item: MemoryProposal, commandId: string, answer: string) {
+		const questionId = proposalQuestionId(item.id);
+		return journal.applyCommand({ id: commandId, produce: () => [{ type: "message.in", data: {
+			id: commandId, questionId, answer, source: "text",
+			text: `记忆提案 ${item.path}：用户选择「${answer}」；实际结果：${item.status === "applied" ? "已保存并核验" : item.status === "rejected" ? "已拒绝，未修改文件" : "版本冲突，未应用修改"}。提案 ${item.id}。`,
+		} }] });
+	}
+	// Recover the boundaries between durable proposal/write receipts and question events.
+	for (const item of memory.listPending()) publishProposal(item);
+	for (const question of [...tracker.state.questions]) {
+		if (!question.questionId.startsWith("memory:")) continue;
+		const item = memory.getProposal(question.questionId.slice(7));
+		if (item && item.status !== "pending" && item.commandId) recordProposalAnswer(item, item.commandId, item.status === "rejected" ? "拒绝此修改" : "批准此修改");
+	}
+	function memoryPath(raw: unknown): string {
+		if (typeof raw !== "string" || !raw || !isReadableMemoryPath(raw, homeDir)) throw new Error("文件不在记忆内容允许范围内");
+		const segments = (path.isAbsolute(raw) ? raw.slice(1) : raw).split("/");
+		if (raw.includes("\\") || raw.includes("\0") || segments.some(part => !part || part === "." || part === "..")) {
+			throw new Error("记忆路径不能包含跳转或别名片段");
+		}
+		return path.relative(homeDir, path.resolve(homeDir, raw));
+	}
 	const gateway = createGatewayServer({
 		socketPath: gatewaySocketPath,
 		log,
 		handle: (request) => {
+			// 旧进程不能绕过取消继续说话/调用工具。测试的无 Agent 内核保留直接网关接口。
+			if (!agentDisabled && (!activeGeneration || breath?.retired || request.generation !== activeGeneration)) {
+				return { ok: false, error: "Agent 实例已失效，请等待新一轮" };
+			}
 			switch (request.kind) {
+				case "memory.context": {
+					try {
+						const constraints = memory.read("context/constraints.md");
+						return { ok: true, ...buildMemoryContext({ homeDir, state: tracker.state, capabilities: capabilitiesFact(),
+							runtimeContext: `当前运行：${currentRunId ?? "尚未开始"}；当前上海时间：${new Date().toLocaleString("sv-SE", { timeZone: "Asia/Shanghai" })}。快照刷新不代表再次醒来。\n` +
+								(requestedIntervalMs === undefined ? "本轮尚未请求下次唤醒间隔。" : `本轮已请求下次唤醒间隔 ${requestedIntervalMs / 1000} 秒；将在本轮结束后排程，无需为同一决定重复调用。`),
+							agreementsContext: memoryManagement.agreementContext(),
+							constraintsProvenance: memory.getApproval(constraints.path, constraints.version) ?? undefined,
+							contextWindow: Number(request.contextWindow), outputReserve: Number(request.outputReserve), historyTokens: Number(request.historyTokens) }) };
+					} catch (error) {
+						const detail = error instanceof Error ? error.message : String(error);
+						if (request.probe !== true) journal.append("system.problem", { code: "memory.context.failed", userMessage: "必要记忆无法完整装入，本次模型调用已停止。", detail });
+						return { ok: false, error: detail, code: error instanceof MemoryContextError ? error.code : "unreadable" };
+					}
+				}
+				case "memory.read": {
+					if (settings.security.agentShell === "off") return { ok: false, error: "当前档位不允许主动读取文件" };
+					const file = memoryPath(request.path);
+					let snapshot: { path: string; content: string | null; version: string };
+					if (file.startsWith("conversations/") || file.startsWith("thoughts/")) {
+						const target = path.join(homeDir, file);
+						const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+						try {
+							const stat = fs.fstatSync(fd);
+							if (!stat.isFile() || stat.nlink !== 1 || stat.size > 4 * 1024 * 1024) throw new Error("文件过大或不是独立普通文件，请使用 memory_history 查询");
+							snapshot = { path: file, content: fs.readFileSync(fd, "utf8"), version: "projection-readonly" };
+						} finally { fs.closeSync(fd); }
+					} else snapshot = memory.read(file);
+					const offset = Math.max(1, Math.floor(Number(request.offset ?? 1)));
+					const limit = Math.max(1, Math.min(1000, Math.floor(Number(request.limit ?? 200))));
+					if (!Number.isFinite(offset) || !Number.isFinite(limit)) throw new Error("分页参数无效");
+					const lines = snapshot.content?.split("\n") ?? [];
+					const page = lines.slice(offset - 1, offset - 1 + limit).join("\n");
+					return { ok: true, ...snapshot, content: snapshot.content === null ? null : page.slice(0, 48000), offset, totalLines: lines.length, truncated: page.length > 48000 || offset - 1 + limit < lines.length };
+				}
+				case "memory.write":
+				case "memory.edit":
+				case "memory.propose": {
+					if (settings.security.agentShell !== "on" && settings.security.agentShell !== "full") return { ok: false, error: "当前档位不允许修改记忆或提交提案" };
+					const file = memoryPath(request.path);
+					const id = `${request.generation ?? "test"}:${String(request.requestId ?? "")}`;
+					if (typeof request.requestId !== "string" || !request.requestId) throw new Error("缺少记忆操作幂等 ID");
+					const base = request.baseVersion as string;
+					if (request.kind === "memory.propose") {
+						const item = memory.proposal(file, request.content as string, base, request.reason as string, id);
+						publishProposal(item);
+						return { ok: true, proposalId: item.id, status: item.status, questionId: proposalQuestionId(item.id), note: "提案不等于批准或已写入" };
+					}
+					const result = request.kind === "memory.write" ? memory.write(file, request.content as string, base, id) : memory.edit(file, request.oldText as string, request.newText as string, base, id);
+					if (file === "identity.md") refreshCompanionName();
+					return { ok: true, ...result };
+				}
+				case "memory.history": {
+					if (settings.security.agentShell === "off") return { ok: false, error: "当前档位不允许主动检索历史" };
+					return { ok: true, ...queryMemoryHistory(homeDir, { seq: request.seq as number | undefined, beforeSeq: request.beforeSeq as number | undefined, date: request.date as string | undefined, query: request.query as string | undefined, limit: request.limit as number | undefined }) };
+				}
+				case "tool.authorize": {
+					const tool = String(request.tool ?? "");
+					const tools = allowedToolsFor(settings.security.agentShell);
+					if (!tools.includes(tool)) {
+						journal.append("tool.decided", { tool, decision: "block", input: String(request.input ?? "").slice(0, 200), reason: "当前权限不允许使用这个工具", runId: currentRunId });
+						return { ok: false, error: "当前权限不允许使用这个工具" };
+					}
+					return { ok: true };
+				}
 				case "capability.say": {
-					const quiet = scheduler.isQuiet();
+					const quiet = currentTrigger !== "wake" && scheduler.isQuiet();
 					const text = String(request.text ?? "");
 					// 回话不算"主动开口"；定时醒来主动说话才受额度限制
-					const isReply = currentTrigger === "message" || currentTrigger === "recovered-queue";
+					const isReply = currentTrigger === "message" || currentTrigger === "recovered-queue" || currentTrigger === "wake";
 					// 安静时段不打扰：收着，早上再说（channel=digest）
 					if (quiet) {
-						const event = journal.append("message.out", { text, channel: "digest", origin: currentTrigger ?? "unknown" });
+						const event = journal.append("message.out", { text, companionName: refreshCompanionName(), channel: "digest", origin: currentTrigger ?? "unknown" });
 						return { ok: true, delivered: "digest", reason: "安静时段：已经记成留言，明早再说", seq: event.seq };
 					}
 					const usedToday = proactiveUsedToday();
@@ -843,15 +1060,15 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 						const reason = proactive.enabled
 							? `今天主动说话的额度用完了（${usedToday}/${proactive.perDay}）`
 							: "主动说话已关闭";
-						const event = journal.append("message.out", { text, channel: "digest", origin: currentTrigger ?? "unknown", cappedBy: "proactive" });
+						const event = journal.append("message.out", { text, companionName: refreshCompanionName(), channel: "digest", origin: currentTrigger ?? "unknown", cappedBy: "proactive" });
 						return { ok: true, delivered: "digest", reason: `${reason}：已经记成留言，不进弹窗`, seq: event.seq };
 					}
-					const event = journal.append("message.out", { text, channel: "bubble", origin: currentTrigger ?? "unknown" });
+					const event = journal.append("message.out", { text, companionName: refreshCompanionName(), channel: "bubble", origin: currentTrigger ?? "unknown" });
 					if (!isReply) proactiveSaysToday += 1;
 					return { ok: true, delivered: "bubble", seq: event.seq };
 				}
 				case "capability.leave_message": {
-					const event = journal.append("message.out", { text: String(request.text ?? ""), channel: "digest" });
+					const event = journal.append("message.out", { text: String(request.text ?? ""), companionName: refreshCompanionName(), channel: "digest" });
 					return { ok: true, delivered: "digest", seq: event.seq };
 				}
 				case "capability.set_next_breath": {
@@ -860,9 +1077,12 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 					return { ok: true, nextInSeconds: Math.round(ms / 1000), note: "只影响下一次醒来" };
 				}
 				case "capability.ask_user": {
+					const question = String(request.question ?? "").trim();
+					if (!question) return { ok: false, error: "问题不能为空" };
 					const options = Array.isArray(request.options) ? request.options.slice(0, 4).map(String) : [];
-					const event = journal.append("question.asked", { question: String(request.question ?? ""), options });
-					return { ok: true, seq: event.seq };
+					const questionId = `question-${journal.seq + 1}`;
+					const event = journal.append("question.asked", { questionId, question, options });
+					return { ok: true, seq: event.seq, questionId, status: "pending", note: "问题已登记；回答之前不能视为授权" };
 				}
 				case "tool.decided": {
 					journal.append("tool.decided", {
@@ -1053,6 +1273,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 				apiFormats: API_FORMATS,
 				quietHours: { ...scheduler.quietHours },
 				proactive: { ...proactive },
+				security: { ...settings.security },
 				source: settings.source,
 				piAvailable: Boolean(breath),
 				piBin,
@@ -1061,11 +1282,16 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			}),
 
 			// 名字由内核给（身份是它自己的数据）——外壳只负责显示
-			status: () => ({ ...tracker.state, companionName, ...activityFacts() }),
+			memoryManage: request => {
+				const result = memoryManagement.handle(request);
+				if (request.action === "restore" && request.path === "identity.md") refreshCompanionName();
+				return result;
+			},
+			status: () => ({ ...tracker.state, companionName: refreshCompanionName(), ...activityFacts() }),
 			snapshot: () => ({
 				protocolVersion: PROTOCOL_VERSION,
 				seq: journal.seq,
-				state: { ...tracker.state, companionName, ...activityFacts() },
+				state: { ...tracker.state, companionName: refreshCompanionName(), ...activityFacts() },
 				imports: importReports,
 				piAvailable: Boolean(breath),
 				setup: inspectSetup(homeDir, piBin, Boolean(breath), scheduler.quietHours),
@@ -1098,7 +1324,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 			},
 			// 只读记录：**按天聚合**（一天一条），因为"一天一份"才是人翻记录的方式。
 			// 日记与探索笔记来自文件（内核是唯一读者），对话与思维流来自读模型。
-			records: (kind, limit) => {
+			records: (kind, limit, beforeDate) => {
 				const state = tracker.state;
 				const dayOf = (iso: string) =>
 					new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(iso));
@@ -1187,35 +1413,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 				}
 
 				if (kind === "conversations") {
-					type Item = { at: string; who?: string; text: string };
-					const items: Item[] =
-						kind === "conversations"
-							? [
-									...state.messages.map((m) => ({ at: m.at, who: "你", text: m.text })),
-									...state.outgoing.map((o) => ({ at: o.at, who: "它", text: o.text })),
-								].sort((a, b) => (a.at < b.at ? -1 : 1))
-							: state.thoughtTimeline.map((entry) => ({ at: entry.at, text: entry.text }));
-
-					const byDay = new Map<string, Item[]>();
-					for (const item of items) {
-						const day = dayOf(item.at);
-						if (!byDay.has(day)) byDay.set(day, []);
-						byDay.get(day)!.push(item);
-					}
-					const entries = [...byDay.entries()]
-						.sort((a, b) => (a[0] < b[0] ? 1 : -1))
-						.slice(0, limit)
-						.map(([date, list]) => ({
-							id: `conversations:${date || "unknown"}`,
-							date,
-							title: kind === "conversations" ? `${date} 的对话` : `${date} 的思维`,
-							count: list.length,
-							preview: list[0]?.text?.slice(0, 80) ?? "",
-							text: list
-								.map((item) => (item.who ? `${clockOf(item.at)} ${item.who}：${item.text}` : `${clockOf(item.at)}　${item.text}`))
-								.join("\n\n"),
-						}));
-					return { kind, entries };
+					return queryConversationRecords(homeDir, companionName, { limit, beforeDate });
 				}
 
 				// 日记 / 探索笔记：按天合并（一天多篇就并成一条）
@@ -1300,14 +1498,46 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 				};
 			},
 			eventsSince: (seq) => journal.events.filter((event) => event.seq > seq),
-			command: (raw) => {
+			command: async (raw) => {
 				const parsed = parseCommand(raw);
 				if ("error" in parsed) throw new Error(parsed.error);
+
+				if (parsed.type === "question.answer") {
+					if (parsed.questionId.startsWith("memory:")) {
+						if (parsed.answer !== "批准此修改" && parsed.answer !== "拒绝此修改") throw new Error("请选择「批准此修改」或「拒绝此修改」；其他文字不构成授权");
+						let item: MemoryProposal;
+						try { item = memory.resolve(parsed.questionId.slice(7), parsed.answer === "批准此修改", parsed.id); }
+						catch (error) {
+							const failed = memory.getProposal(parsed.questionId.slice(7));
+							if (failed?.status === "conflict" && failed.commandId === parsed.id) recordProposalAnswer(failed, parsed.id, parsed.answer);
+							throw error;
+							}
+						const outcome = recordProposalAnswer(item, parsed.id, parsed.answer);
+						if (!outcome.duplicate) { if (timer) clearTimeout(timer); void runBreath("wake"); }
+						return { duplicate: outcome.duplicate, questionId: parsed.questionId, answered: true, status: item.status, verified: item.result?.verified ?? false };
+					}
+					const outcome = journal.applyCommand({
+						id: parsed.id,
+						produce: () => {
+							const question = tracker.state.questions.find(question => question.questionId === parsed.questionId);
+							if (!question) throw new Error("问题不存在或已经回答，请刷新面板");
+							// 同一个持久事件同时解决问题并进入 inbox，不能在两个 effect 间丢回答。
+							return [{ type: "message.in", data: { id: parsed.id, questionId: parsed.questionId, answer: parsed.answer, text: `关于「${question.question}」的回答：${parsed.answer}`, source: "text" } }];
+						},
+					});
+					if (!outcome.duplicate) {
+						// 兼容旧外壳的通知；权威状态已经由上面的原子事件完成。
+						journal.append("question.answered", { questionId: parsed.questionId, answer: parsed.answer }, parsed.id);
+						if (timer) clearTimeout(timer);
+						void runBreath("wake");
+					}
+					return { duplicate: outcome.duplicate, questionId: parsed.questionId, answered: true };
+				}
 
 				if (parsed.type === "message.send") {
 					const outcome = journal.applyCommand({
 						id: parsed.id,
-						produce: () => [{ type: "message.in" as const, data: { text: parsed.text, source: parsed.source } }],
+						produce: () => [{ type: "message.in" as const, data: { id: parsed.id, text: parsed.text, source: parsed.source } }],
 					});
 					if (outcome.duplicate) return { duplicate: true, result: outcome.result };
 					// 暂停优先于一切：用户说了"安静一会儿"，一条留言不该把它吵醒。
@@ -1369,6 +1599,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 					}
 					if (validated.patch.quietHours) patchForAudit.quietHours = validated.patch.quietHours;
 					if (validated.patch.proactive) patchForAudit.proactive = validated.patch.proactive;
+					if (validated.patch.security) patchForAudit.security = validated.patch.security;
 					const next = patchSettings(homeDir, validated.patch);
 					settings = next;
 					// 审计：设置是谁、什么时候、改成了什么（**不记密钥值**）。
@@ -1406,18 +1637,17 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 								before.model.baseUrl !== next.model.baseUrl ||
 								before.model.apiKey !== next.model.apiKey),
 					);
-					if (modelChanged) {
-						// 模型改了就换引擎：停掉旧的 pi，按新设置起一个
-						restartingAgent = true;
-						stopAgent();
-						startAgent();
-						restartingAgent = false;
+					const securityChanged = before.security.agentShell !== next.security.agentShell;
+					if (modelChanged || securityChanged) {
+						await replaceAgent(securityChanged ? "工具权限变更" : "模型配置变更");
 						restarted = true;
-						if (breath) journal.append("presence.changed", { state: scheduler.isQuiet() ? "quiet" : "breathing" });
+						if (stopped) return { applied: true, piRestarted: false };
+						if (breath) journal.append("presence.changed", { state: scheduler.activePause(pause) ? "paused" : scheduler.isQuiet() ? "quiet" : "breathing" });
 						journal.append("system.problem", {
-							code: "model.changed",
-							userMessage: `模型已换成 ${next.model.mode === "custom" ? `${next.model.model}（${next.model.apiFormat}）` : `${next.model.provider}/${next.model.model}`}`,
+							code: securityChanged ? "security.changed" : "model.changed",
+							userMessage: securityChanged ? `工具权限已更新为 ${next.security.agentShell}` : `模型已换成 ${next.model.mode === "custom" ? `${next.model.model}（${next.model.apiFormat}）` : `${next.model.provider}/${next.model.model}`}`,
 						});
+						scheduleNext();
 					} else if (validated.patch.model) {
 						journal.append("settings.changed", { note: "模型字段提交了但值没变，未重启引擎", source: parsed.source ?? "unknown" });
 					}
@@ -1425,6 +1655,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 						applied: true,
 						piRestarted: restarted,
 						modelChanged,
+						securityChanged,
 						piAvailable: Boolean(breath),
 						describe: describeSettings(next),
 						quietHours: { ...scheduler.quietHours },
@@ -1453,10 +1684,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 				// 既能解除暂停，也能越过安静时段：夜里人就在屏幕前想说话，
 				// 让它"等早上七点"是把日程摆在了人前面（真实用户反馈：点了叫醒没反应）。
 				// 自动呼吸、以及普通留言，仍然照旧遵守安静时段。
-				if (scheduler.activePause(pause)) {
-					pause = null;
-					journal.append("breath.resumed", { reason: "用户显式叫醒" });
-				}
+				// 显式叫醒只覆盖本轮，不永久修改用户的暂停安排。
 				const overrodeQuiet = scheduler.isQuiet();
 				if (timer) clearTimeout(timer);
 				void runBreath("wake");
@@ -1469,7 +1697,7 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 
 	// ─── 5. 开门：安排第一拍（有待处理留言就立刻补上） ───
 	const state = tracker.state;
-	if (state.pendingMessages.length > 0 && !scheduler.isQuiet()) {
+	if (state.pendingMessages.length > 0 && !scheduler.isQuiet() && !scheduler.activePause(pause)) {
 		log(`[core] 恢复 ${state.pendingMessages.length} 条待处理留言，立即呼吸`);
 		void runBreath("recovered-queue");
 	} else {
@@ -1483,11 +1711,11 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 		socketPath,
 		journal,
 		importReports,
-		status: () => ({ ...tracker.state, companionName, ...activityFacts() }),
+		status: () => ({ ...tracker.state, companionName: refreshCompanionName(), ...activityFacts() }),
 		snapshot: () => ({
 			protocolVersion: PROTOCOL_VERSION,
 			seq: journal.seq,
-			state: { ...tracker.state, companionName, ...activityFacts() },
+			state: { ...tracker.state, companionName: refreshCompanionName(), ...activityFacts() },
 			imports: importReports,
 			piAvailable: Boolean(breath),
 			setup: inspectSetup(homeDir, piBin, Boolean(breath), scheduler.quietHours),
@@ -1495,10 +1723,24 @@ export async function startKernel(config: KernelConfig = {}): Promise<Kernel> {
 		breathNow: (trigger = "manual") => runBreath(trigger),
 		stop() {
 			stopped = true;
+			activeGeneration = null;
+			// 唤醒 runner 的终止等待；不能只摘事件 handler 留下 120 秒悬挂 timer。
+			void breath?.cancel("内核停止");
 			// 干净退出时落一个检查点：下次启动几乎瞬间就绪
 			journal.writeCheckpoint();
 			if (timer) clearTimeout(timer);
 			pi?.stop();
+			gateway.close();
+			rpc?.close();
+			journal.close();
+		},
+		async shutdown() {
+			stopped = true;
+			activeGeneration = null;
+			if (timer) clearTimeout(timer);
+			await breath?.cancel("内核停止");
+			await pi?.terminate();
+			journal.writeCheckpoint();
 			gateway.close();
 			rpc?.close();
 			journal.close();
@@ -1535,9 +1777,9 @@ if (invokedDirectly) {
 		quietHours: { start: quietStart, end: quietEnd },
 		log: (message) => console.log(message),
 	});
-	const shutdown = () => {
+	const shutdown = async () => {
 		console.log("[core] 收到退出信号，收尾中");
-		kernel.stop();
+		await kernel.shutdown();
 		process.exit(0);
 	};
 	process.on("SIGTERM", shutdown);

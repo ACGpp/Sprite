@@ -1,0 +1,73 @@
+name: Draft macOS release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.14.0"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            Scripts/runtime/package-lock.json
+      - run: npm ci
+      - run: npm install -g @mariozechner/pi-coding-agent@0.70.2
+      - name: Verify tag and architecture
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: node -e 'if (process.env.RELEASE_TAG !== `v${require("./package.json").version}` || process.arch !== process.env.RELEASE_ARCH) process.exit(1)'
+      - name: Validate
+        run: |
+          npm run core:typecheck
+          npm run policy:typecheck
+          npm run pi:typecheck
+          npm run typecheck
+          npm run core:test
+          npm run release:test
+          npm run shell:test
+      - name: Build and smoke-test self-contained app
+        run: npm run package:macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sprite-${{ matrix.arch }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/SHA256SUMS-*.txt
+          if-no-files-found: error
+  draft:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: Sprite-*
+          merge-multiple: true
+          path: release
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          body_path: RELEASE_NOTES.md
+          files: |
+            release/*.dmg
+            release/*.zip
+            release/SHA256SUMS-*.txt
+          fail_on_unmatched_files: true

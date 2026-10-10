@@ -83,6 +83,38 @@ test("调度器：间隔、自主要求、限幅、暂停、失败退避", () =>
 
 // ─── 呼吸 ───
 
+test("工具结果：失败与核验成功分别留痕，重复/未知结果不计数，纯调度不算实质活动", async () => {
+	const journal = openJournal({ dir: freshDir("breath-tool-outcomes"), exclusive: true, fsync: false });
+	const pi = fakePi(emit => {
+		for (const [id, tool, isError, details] of [
+			["bad", "edit", true, { ok: false, verified: true }],
+			["good", "write", false, { ok: true, verified: true }],
+			["unknown", "write", false, {}],
+			["schedule", "set_next_breath", false, {}],
+		] as const) {
+			emit({ type: "tool_execution_start", toolCallId: id, toolName: tool, args: { path: "notes/test.md" } });
+			const end = { type: "tool_execution_end", toolCallId: id, toolName: tool, isError, result: { details, content: [{ type: "text", text: "SECRET_TOOL_OUTPUT" }] } };
+			emit(end); emit(end);
+		}
+		emit({ type: "tool_execution_end", toolCallId: "from-another-run", toolName: "write", isError: false });
+		emit({ type: "agent_end" });
+	});
+	try {
+		const runner = createBreathRunner({ journal, pi: pi.agent, isQuiet: () => false });
+		assert.equal((await runner.run("timer")).ok, true);
+		const results = journal.events.filter(event => event.type === "tool.finished");
+		assert.equal(results.length, 4);
+		assert.deepEqual(results.map(event => [event.data.toolCallId, event.data.success, event.data.verified]), [
+			["bad", false, false], ["good", true, true], ["unknown", true, false], ["schedule", true, false],
+		]);
+		assert.ok(results.every(event => event.data.runId && event.data.path === "notes/test.md"));
+		assert.doesNotMatch(JSON.stringify(journal.events), /SECRET_TOOL_OUTPUT/);
+		const finished = journal.events.find(event => event.type === "run.finished")!;
+		assert.equal(finished.data.activities, 4);
+		assert.equal(finished.data.substantiveActivities, 3);
+	} finally { journal.close(); }
+});
+
 test("呼吸：完整一拍把真实事件写进 journal", async () => {
 	const dir = freshDir("breath-ok");
 	const journal = openJournal({ dir, exclusive: true, fsync: false });

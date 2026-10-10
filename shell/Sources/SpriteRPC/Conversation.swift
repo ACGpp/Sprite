@@ -16,6 +16,7 @@ public struct ConversationTurn: Sendable, Equatable, Identifiable {
 	public let pending: Bool
 	/// 安静时段被内核收着的话（channel=digest）：界面上要标出来
 	public let heldBack: Bool
+	public let failure: String?
 
 	public init(
 		id: String,
@@ -25,7 +26,8 @@ public struct ConversationTurn: Sendable, Equatable, Identifiable {
 		seq: Int,
 		imported: Bool = false,
 		pending: Bool = false,
-		heldBack: Bool = false
+		heldBack: Bool = false,
+		failure: String? = nil
 	) {
 		self.id = id
 		self.fromMe = fromMe
@@ -35,6 +37,7 @@ public struct ConversationTurn: Sendable, Equatable, Identifiable {
 		self.imported = imported
 		self.pending = pending
 		self.heldBack = heldBack
+		self.failure = failure
 	}
 }
 
@@ -49,7 +52,7 @@ public enum Conversation {
 		var turns: [ConversationTurn] = []
 		for message in messages {
 			turns.append(ConversationTurn(
-				id: "in-\(message.seq)",
+				id: message.id ?? "in-\(message.seq)",
 				fromMe: true,
 				text: message.text,
 				at: message.at,
@@ -83,8 +86,24 @@ public enum Conversation {
 		return turns
 	}
 
-	/// 「现在」视图用的：不含导入的旧历史（那是归档，在「对话记录」里看）
-	public static func live(_ turns: [ConversationTurn]) -> [ConversationTurn] {
-		turns.filter { !$0.imported }
+	/// 与内核的记录分组、session 使用同一个上海自然日。
+	public static func dayStart(_ date: Date) -> Date {
+		var calendar = Calendar(identifier: .gregorian)
+		calendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
+		return calendar.startOfDay(for: date)
+	}
+
+	/// 「现在」只展示今天的新对话；历史仍保留在「对话记录」。
+	public static func live(_ turns: [ConversationTurn], now: Date = Date()) -> [ConversationTurn] {
+		let start = dayStart(now)
+		let parser = ISO8601DateFormatter()
+		let fractionalParser = ISO8601DateFormatter()
+		fractionalParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+		return turns.filter { turn in
+			guard !turn.imported else { return false }
+			if turn.pending || turn.failure != nil { return true }
+			guard let at = fractionalParser.date(from: turn.at) ?? parser.date(from: turn.at) else { return false }
+			return dayStart(at) == start
+		}
 	}
 }

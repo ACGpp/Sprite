@@ -31,10 +31,13 @@ export type EventType =
 	| "breath.resumed"
 	| "wake.deferred"
 	| "tool.decided"
+	| "tool.finished"
 	| "question.asked"
+	| "question.answered"
 	| "voice.recorded"
 	| "voice.transcribed"
 	| "settings.changed"
+	| "identity.changed"
 	| "command.applied"
 	| "legacy.imported"
 	| "system.problem";
@@ -61,10 +64,13 @@ const EVENT_TYPES = new Set<string>([
 	"breath.resumed",
 	"wake.deferred",
 	"tool.decided",
+	"tool.finished",
 	"question.asked",
+	"question.answered",
 	"voice.recorded",
 	"voice.transcribed",
 	"settings.changed",
+	"identity.changed",
 	"command.applied",
 	"legacy.imported",
 	"system.problem",
@@ -107,6 +113,8 @@ export type WakeNowCommand = { id: string; type: "wake.now" };
 export type PauseCommand = { id: string; type: "breath.pause"; until: "hour" | "tonight" | "manual" };
 
 export type ResumeCommand = { id: string; type: "breath.resume" };
+
+export type AnswerQuestionCommand = { id: string; type: "question.answer"; questionId: string; answer: string };
 
 /**
  * 一条语音留言：音频文件 + 转写文字。
@@ -152,6 +160,7 @@ export type Command =
 	| WakeNowCommand
 	| PauseCommand
 	| ResumeCommand
+	| AnswerQuestionCommand
 	| VoiceCommitCommand
 	| VoiceTranscriptCommand
 	| SettingsUpdateCommand;
@@ -168,6 +177,13 @@ export function parseCommand(raw: unknown): Command | { error: string } {
 		}
 		case "wake.now":
 			return { id: candidate.id, type: "wake.now" };
+		case "question.answer": {
+			const questionId = typeof candidate.questionId === "string" ? candidate.questionId.trim() : "";
+			const answer = typeof candidate.answer === "string" ? candidate.answer.trim() : "";
+			if (!questionId || !answer) return { error: "问题和回答不能为空" };
+			if (answer.length > 20_000) return { error: "回答太长，请控制在 20000 字符以内" };
+			return { id: candidate.id, type: "question.answer", questionId, answer };
+		}
 		case "voice.commit": {
 			const transcript = typeof candidate.transcript === "string" ? candidate.transcript.trim() : "";
 			const hasAudio = typeof candidate.audioBase64 === "string" && candidate.audioBase64.length > 0;

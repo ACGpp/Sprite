@@ -17,7 +17,19 @@ struct RecordsView: View {
 		case conversations = "对话记录"
 		case thoughts = "思维流"
 		case voice = "语音"
+		case memory = "记忆"
 		case settings = "设置"
+
+		init(request: RecordsSectionRequest) {
+			switch request {
+			case .live: self = .live
+			case .voice: self = .voice
+			case .diary: self = .diary
+			case .conversations: self = .conversations
+			case .settings: self = .settings
+			case .memory: self = .memory
+			}
+		}
 
 		var id: String { rawValue }
 		var symbol: String {
@@ -29,13 +41,15 @@ struct RecordsView: View {
 			case .thoughts: return "brain"
 			case .voice: return "waveform"
 			case .settings: return "gearshape"
+			case .memory: return "archivebox"
 			}
 		}
 		var isLive: Bool { self == .live }
 		var isSettings: Bool { self == .settings }
+		var isMemory: Bool { self == .memory }
 		var queryKind: String {
 			switch self {
-			case .live, .settings: return "conversations" // 不查询；占位以免漏分支
+			case .live, .settings, .memory: return "conversations" // 不查询；占位以免漏分支
 			case .diary: return "diary"
 			case .explorations: return "explorations"
 			case .conversations: return "conversations"
@@ -61,6 +75,9 @@ struct RecordsView: View {
 	/// 只给验证用：截图时预选第 N 条，才能验证"右栏跟不跟着选中走"
 	private let initialSelection: Int
 	@State private var entries: [[String: String]] = []
+	@State private var nextCursor: String?
+	@State private var loadingMore = false
+	@State private var recordsLoadID = UUID()
 	/// 选中的是**第几条**，不是"哪本字典"。
 	///
 	/// 老实现用值相等反查条目（拿 path/at/text 去比）——聚合出来的"按天一条"
@@ -79,88 +96,49 @@ struct RecordsView: View {
 	/// 否则"看过日记 → 切到对话记录"会看到日记正文（真实反馈："我在里面发现了日记"）。
 	@State private var documentPath: String = ""
 	@State private var loading = false
+	@State private var documentLoading = false
+	@State private var documentLoadID = UUID()
+	@State private var listError: String?
+	@State private var documentError: String?
 	@State private var playbackError: String?
 
 	var body: some View {
-		NavigationSplitView(columnVisibility: $columnVisibility) {
-			List(Section.allCases, selection: Binding(
-				get: { section },
-				set: { if let value = $0 { section = value } }
-			)) { item in
-				Label(item.rawValue, systemImage: item.symbol).tag(item)
-			}
-			.navigationSplitViewColumnWidth(min: 150, ideal: 168, max: 200)
-			.listStyle(.sidebar)
-		} content: {
-			List(entries.indices, id: \.self, selection: $selectedIndex) { index in
-				let entry = entries[index]
-				VStack(alignment: .leading, spacing: 3) {
-					Text(entry["title"] ?? entry["who"] ?? L("（无标题）"))
-						.font(.system(size: 12.5, weight: .medium))
-						.lineLimit(1)
-					// 列表里**必须显示时间**——笔记正文里常常没有时间，标签由我们标上
-					if let meta = metaLine(entry) {
-						Text(meta).font(.system(size: 10.5)).foregroundStyle(.secondary).lineLimit(1)
-					}
-					if let preview = entry["preview"], !preview.isEmpty {
-						Text(preview).font(.system(size: 11)).foregroundStyle(.tertiary).lineLimit(2)
-					}
+		Group {
+			// 「现在」与设置没有按天条目，使用两栏，始终保留分区导航。
+			if section.isLive || section.isSettings || section.isMemory {
+				NavigationSplitView(columnVisibility: $columnVisibility) {
+					sectionList
+				} detail: {
+					recordDetail
 				}
-				.padding(.vertical, 2)
-				// **必须有 tag**：`List(selection:)` 靠它把"被点的这一行"映射回选择值。
-				// 少了它，预选（截图验证那种走的是状态）能正常工作，**手点却完全没反应**——
-				// 真实反馈："点 16、15、14 还是 7、10，右边都不会切换"。
-				// 侧栏那份一直有 `.tag(item)`，所以侧栏能点、中栏不能。
-				.tag(index)
-				.contentShape(Rectangle()) // 整行可点，不只是文字
-			}
-			.navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
-		} detail: {
-			ScrollViewReader { proxy in
-			ScrollView {
-				VStack(alignment: .leading, spacing: 12) {
-					Color.clear.frame(height: 1).id("detail-top")
-					if section.isLive {
-						ConversationView(model: model)
-					} else if section.isSettings {
-						SettingsView(model: model)
-					} else if loading {
-						ProgressView().controlSize(.small)
-					} else if section == .voice, let selected {
-						voiceDetail(selected)
-					} else if !document.isEmpty {
-						Text(document)
-							.font(.system(size: 13))
-							.textSelection(.enabled)
-							.fixedSize(horizontal: false, vertical: true)
-					} else if let selected {
-						Text(selected["text"].flatMap { $0.isEmpty ? nil : $0 } ?? selected["preview"] ?? "（没有内容）")
-							.font(.system(size: 13))
-							.textSelection(.enabled)
-							.fixedSize(horizontal: false, vertical: true)
-					} else {
-						Text(L("左边选一条看看"))
-							.foregroundStyle(.tertiary)
-					}
-					Spacer(minLength: 0)
+			} else {
+				NavigationSplitView(columnVisibility: $columnVisibility) {
+					sectionList
+				} content: {
+					entryList
+				} detail: {
+					recordDetail
 				}
-				.frame(maxWidth: .infinity, alignment: .leading)
-				.padding(20)
-			}
-			// 换了条目就滚回顶部：锚点 id 是**固定的**，不制造视图身份变化
-			// （上一次用 `.id(selectedIndex)` 改身份，AppKit 在布局中抛异常直接崩了）
-			.onChange(of: selectedIndex) { _, _ in
-				withAnimation(nil) { proxy.scrollTo("detail-top", anchor: .top) }
-			}
 			}
 		}
 		.frame(minWidth: 820, minHeight: 520)
-		.onAppear { if !section.isLive && !section.isSettings { reload() } }
+		.onAppear { if !section.isLive && !section.isSettings && !section.isMemory { reload() } }
+		.onChange(of: model.recordsRequestToken) { _, _ in
+			section = Section(request: model.recordsRequest)
+		}
 		.onChange(of: section) { _, newValue in
-			columnVisibility = newValue.isLive || newValue.isSettings ? .detailOnly : .all
+			columnVisibility = .all
+			documentLoadID = UUID()
+			documentLoading = false
+			listError = nil
+			documentError = nil
+			recordsLoadID = UUID()
+			nextCursor = nil
+			loadingMore = false
 			model.onLiveSectionChange?(newValue.isLive)
-			if newValue.isLive || newValue.isSettings {
+			if newValue.isLive || newValue.isSettings || newValue.isMemory {
 				selectedIndex = nil
+				entries = []
 				document = ""
 				documentPath = ""
 				loading = false
@@ -180,6 +158,102 @@ struct RecordsView: View {
 		}
 		.onChange(of: model.recordsRevision) { _, _ in if section == .voice { reload() } }
 		.onChange(of: model.connected) { _, connected in if connected && entries.isEmpty { reload() } }
+	}
+
+	private var sectionList: some View {
+		List(Section.allCases, selection: Binding(
+			get: { section },
+			set: { if let value = $0 { section = value } }
+		)) { item in
+			Label(L(item.rawValue), systemImage: item.symbol).tag(item)
+		}
+		.navigationSplitViewColumnWidth(min: 150, ideal: 168, max: 200)
+		.listStyle(.sidebar)
+	}
+
+	private var entryList: some View {
+		VStack(spacing: 4) {
+		List(entries.indices, id: \.self, selection: $selectedIndex) { index in
+			let entry = entries[index]
+			VStack(alignment: .leading, spacing: 3) {
+				Text(entry["title"] ?? entry["who"] ?? L("（无标题）"))
+					.font(.system(size: 12.5, weight: .medium))
+					.lineLimit(1)
+				// 列表里**必须显示时间**——笔记正文里常常没有时间，标签由我们标上
+				if let meta = metaLine(entry) {
+					Text(meta).font(.system(size: 10.5)).foregroundStyle(.secondary).lineLimit(1)
+				}
+				if let preview = entry["preview"], !preview.isEmpty {
+					Text(preview).font(.system(size: 11)).foregroundStyle(.tertiary).lineLimit(2)
+				}
+			}
+			.padding(.vertical, 2)
+			// **必须有 tag**：`List(selection:)` 靠它把"被点的这一行"映射回选择值。
+			// 少了它，预选（截图验证那种走的是状态）能正常工作，**手点却完全没反应**——
+			// 真实反馈："点 16、15、14 还是 7、10，右边都不会切换"。
+			// 侧栏那份一直有 `.tag(item)`，所以侧栏能点、中栏不能。
+			.tag(index)
+			.contentShape(Rectangle()) // 整行可点，不只是文字
+		}
+		if nextCursor != nil {
+			Button(loadingMore ? L("加载中…") : L("加载更早记录")) { loadMore() }
+				.disabled(loadingMore)
+				.padding(8)
+		}
+		}
+		.navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
+	}
+
+	@ViewBuilder
+	private var recordDetail: some View {
+		if section.isMemory { MemoryManagementView(model: model) }
+		else { legacyRecordDetail }
+	}
+
+	private var legacyRecordDetail: some View {
+		ScrollViewReader { proxy in
+		ScrollView {
+			VStack(alignment: .leading, spacing: 12) {
+				Color.clear.frame(height: 1).id("detail-top")
+				if section.isLive {
+					ConversationView(model: model)
+				} else if section.isSettings {
+					SettingsView(model: model)
+				} else if let error = listError {
+					Text(Lf("加载记录失败：%@", error)).foregroundStyle(.orange)
+					Button(L("重试")) { reload() }
+				} else if let error = documentError {
+					Text(Lf("加载正文失败：%@", error)).foregroundStyle(.orange)
+					Button(L("重试")) { documentPath = ""; loadDocumentIfNeeded() }
+				} else if loading || documentLoading {
+					ProgressView().controlSize(.small)
+				} else if section == .voice, let selected {
+					voiceDetail(selected)
+				} else if !document.isEmpty {
+					Text(document)
+						.font(.system(size: 13))
+						.textSelection(.enabled)
+						.fixedSize(horizontal: false, vertical: true)
+				} else if let selected {
+					Text(selected["text"].flatMap { $0.isEmpty ? nil : $0 } ?? selected["preview"] ?? "（没有内容）")
+						.font(.system(size: 13))
+						.textSelection(.enabled)
+						.fixedSize(horizontal: false, vertical: true)
+				} else {
+					Text(L("左边选一条看看"))
+						.foregroundStyle(.tertiary)
+				}
+				Spacer(minLength: 0)
+			}
+			.frame(maxWidth: .infinity, alignment: .leading)
+			.padding(20)
+		}
+		// 换了条目就滚回顶部：锚点 id 是**固定的**，不制造视图身份变化
+		// （上一次用 `.id(selectedIndex)` 改身份，AppKit 在布局中抛异常直接崩了）
+		.onChange(of: selectedIndex) { _, _ in
+			withAnimation(nil) { proxy.scrollTo("detail-top", anchor: .top) }
+		}
+		}
 	}
 
 	/// 一条语音：原话能回听，转写能读。
@@ -262,14 +336,31 @@ struct RecordsView: View {
 	}
 
 	private func reload() {
+		guard !section.isLive && !section.isSettings && !section.isMemory else { return }
 		loading = true
+		listError = nil
+		documentError = nil
+		documentLoading = false
+		documentLoadID = UUID()
 		selectedIndex = nil
 		document = ""
 		documentPath = ""
 		let requested = section
-		model.loadRecords(kind: section.queryKind) { list in
+		let requestID = UUID()
+		recordsLoadID = requestID
+		nextCursor = nil
+		loadingMore = false
+		model.loadRecords(kind: section.queryKind, pageInfo: { cursor in
+			guard requested == section, requestID == recordsLoadID else { return }
+			nextCursor = cursor
+			listError = nil
+		}, onFailure: { failure in
+			guard requested == section, requestID == recordsLoadID else { return }
+			listError = failure
+			loading = false
+		}) { list in
 			// 回调可能来自上一次切换：只认当前分区的结果，别把旧数据画到新分区上
-			guard requested == section else { return }
+			guard requested == section, requestID == recordsLoadID else { return }
 			entries = list
 			loading = false
 			// 每一类都自动选第一条：右侧永远不会是一片空白
@@ -278,7 +369,29 @@ struct RecordsView: View {
 		}
 	}
 
+	private func loadMore() {
+		guard let cursor = nextCursor, !loadingMore else { return }
+		loadingMore = true
+		let requestID = recordsLoadID
+		model.loadRecords(kind: section.queryKind, beforeDate: cursor, pageInfo: { next in
+			guard requestID == recordsLoadID else { return }
+			nextCursor = next
+			listError = nil
+		}, onFailure: { failure in
+			guard requestID == recordsLoadID else { return }
+			listError = failure
+			// 自动重试尚未结束，保留加载锁，避免同一游标被重复追加。
+		}) { list in
+			guard requestID == recordsLoadID else { return }
+			entries.append(contentsOf: list)
+			loadingMore = false
+		}
+	}
+
 	private func loadDocumentIfNeeded() {
+		documentLoadID = UUID()
+		documentLoading = false
+		documentError = nil
 		// 按天聚合的条目自带全文；只有单篇文件才需要去向内核要正文
 		if let text = selected?["text"], !text.isEmpty {
 			document = ""
@@ -293,12 +406,17 @@ struct RecordsView: View {
 		guard path != documentPath || document.isEmpty else { return }
 		document = ""
 		documentPath = path
-		loading = true
-		model.loadDocument(path: path) { text in
+		documentLoading = true
+		let requestID = documentLoadID
+		model.loadDocument(path: path, onFailure: { failure in
+			guard requestID == documentLoadID, documentPath == path else { return }
+			documentError = failure
+			documentLoading = false
+		}) { text in
 			// 回来时已经不是这一条了：丢弃（这就是"对话记录里冒出日记"的成因）
-			guard documentPath == path else { return }
+			guard requestID == documentLoadID, documentPath == path else { return }
 			document = text
-			loading = false
+			documentLoading = false
 		}
 	}
 }

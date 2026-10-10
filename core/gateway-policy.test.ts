@@ -123,8 +123,8 @@ test("能力网关：危险命令被拦下且真的没有执行，越界写入�
 			`越界写入必须被拦: ${JSON.stringify(blocked)}`,
 		);
 		assert.ok(
-			decisions.some((decision) => decision.tool === "bash" && decision.decision === "allow" && decision.input.includes("echo")),
-			"普通 bash 应当放行并留痕",
+			decisions.some((decision) => decision.tool === "bash" && decision.decision === "block" && decision.input.includes("echo")),
+			"通用 bash 不论命令内容都应被拒绝并留痕",
 		);
 		assert.ok(
 			decisions.some((decision) => decision.tool === "read" && decision.decision === "allow"),

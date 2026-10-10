@@ -66,7 +66,7 @@ test("没有这两个文件时不编造空块", () => {
 	assert.doesNotMatch(prompt, /你的工作记忆/);
 });
 
-test("操作件真的送到了引擎面前（假引擎把收到的提示词录下来）", { timeout: 60_000 }, async () => {
+test("持久观察不固化易变记忆（完整装配由 memory-pi 真引擎测试验证）", { timeout: 60_000 }, async () => {
 	const home = path.join(ROOT, "working-view");
 	fs.rmSync(home, { recursive: true, force: true });
 	fs.mkdirSync(path.join(home, "conversations"), { recursive: true });
@@ -128,8 +128,8 @@ test("操作件真的送到了引擎面前（假引擎把收到的提示词录�
 		}
 		assert.ok(fs.existsSync(promptLog), "引擎应当至少被叫醒过一次");
 		const prompts = fs.readFileSync(promptLog, "utf8");
-		assert.match(prompts, /不要跑那个会删日记的脚本/, "约束必须真的送到它面前");
-		assert.match(prompts, /正在重定压缩的口径/, "工作记忆也要在视野里");
+		assert.doesNotMatch(prompts, /不要跑那个会删日记的脚本/, "约束经瞬态context注入，不固化在旧prompt");
+		assert.doesNotMatch(prompts, /正在重定压缩的口径/, "工作便签不能在每次观察中重复固化");
 	} finally {
 		await kernel.stop();
 	}

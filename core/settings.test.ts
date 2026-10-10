@@ -510,7 +510,7 @@ test("同一个模型重复保存：不该反复重启引擎（真实发生：3 
 	}
 });
 
-test("手脚档位：on 用默认工具集，readonly / off 明确收窄，且能落盘", () => {
+test("手脚档位：受控读写、只读与交流分别暴露明确工具集，且能落盘", () => {
 	const home = makeHome("settings-shell");
 	const allowed = validatePatch({ security: { agentShell: "readonly" } });
 	assert.equal(allowed.ok, true);
@@ -520,7 +520,7 @@ test("手脚档位：on 用默认工具集，readonly / off 明确收窄，且�
 	const saved = patchSettings(home, { security: { agentShell: "off" } });
 	assert.equal(saved.security.agentShell, "off");
 	assert.equal(readSettings(home).security.agentShell, "off", "档位要落盘（重启后还在）");
-	assert.equal(allowedToolsFor("on"), null, "on = 不传 --tools，用 pi 的默认工具集");
+	assert.ok(allowedToolsFor("on").includes("write") && !allowedToolsFor("on").includes("bash"), "记忆读写档显式允许受控工具，不能开放 shell");
 	const readonly = allowedToolsFor("readonly")!;
 	assert.ok(readonly.includes("read") && readonly.includes("grep"), "只读档要保留读与搜索");
 	assert.equal(readonly.includes("bash") || readonly.includes("write") || readonly.includes("edit"), false, "只读档不能有 bash/write/edit");
@@ -576,7 +576,8 @@ test("手脚档位真的传给了引擎：readonly / off 时 pi 收到 --tools",
 	};
 
 	const on = await runWith("on");
-	assert.equal(on.includes("--tools"), false, "全开档不该传 --tools（用 pi 的默认工具集）");
+	assert.ok(on.includes("--tools"), "记忆读写档必须显式限制工具");
+	assert.ok(!on[on.indexOf("--tools") + 1]!.split(",").includes("bash"));
 
 	const readonly = await runWith("readonly");
 	const readonlyIndex = readonly.indexOf("--tools");

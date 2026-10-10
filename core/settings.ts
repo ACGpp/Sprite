@@ -11,6 +11,7 @@
  *      "配没配"（`hasApiKey`），不返回值；产物文件 0600。
  */
 
+import { memoryTools, MEMORY_CAPABILITY_TOOLS, MEMORY_READ_TOOLS } from "../contracts/memory-policy.ts";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -109,14 +110,12 @@ export type ModelSettings = {
 /**
  * agent 能用哪些"手脚"。
  *
- * `on`（默认）：bash + 读写文件都可用——这是设计决策 A 的选择（"它有手有脚"），
- *   但要老实说：**bash 不是权限边界**，同 UID 下它能读任何 0600 文件（评审 C3/C4）。
- * `readonly`：只读文件 + 搜索 + 它的能力工具，没有 bash、不能写。
- * `off`：只剩"说话"那几个能力工具（say / leave_message / set_next_breath / ask_user）。
- *
- * 这是给用户的**可选边界**：想要真边界还得靠独立 UID / 沙箱，但至少现在有一个开关。
+ * 保留配置值兼容旧版本：on = 受控记忆读写，readonly = 读取与历史查询，off = 交流。
+ * full = 用户明确启用的自由行动（shell、本地文件和网络）；旧档位不自动升级。
+ * 专用记忆工具仍保留版本核验；full 的 shell 具有当前 OS 用户权限，不是沙箱。
+ * 这是模型工具接口的边界，不承诺隔离恶意同用户进程或受信任扩展代码。
  */
-export type ShellAccess = "on" | "readonly" | "off";
+export type ShellAccess = "full" | "on" | "readonly" | "off";
 
 export type SecuritySettings = {
 	agentShell: ShellAccess;
@@ -147,13 +146,11 @@ export const DEFAULT_SETTINGS: Settings = {
 };
 
 /** 各档位允许 pi 使用哪些工具（能力工具始终保留——它得能说话、能提问） */
-export const CAPABILITY_TOOLS = ["say", "leave_message", "set_next_breath", "ask_user"];
-export const READONLY_TOOLS = [...CAPABILITY_TOOLS, "read", "grep", "find", "ls"];
+export const CAPABILITY_TOOLS = MEMORY_CAPABILITY_TOOLS;
+export const READONLY_TOOLS = [...CAPABILITY_TOOLS, ...MEMORY_READ_TOOLS];
 
-export function allowedToolsFor(access: ShellAccess): string[] | null {
-	if (access === "readonly") return READONLY_TOOLS;
-	if (access === "off") return CAPABILITY_TOOLS;
-	return null; // on = 不传 --tools，用 pi 的默认工具集
+export function allowedToolsFor(access: ShellAccess): string[] {
+	return memoryTools(access);
 }
 
 export function settingsPath(homeDir: string): string {
@@ -199,7 +196,7 @@ export function readSettings(homeDir: string): Settings {
 					perDay: Math.max(0, Math.min(999, Math.round(Number(parsed.proactive?.perDay ?? DEFAULT_SETTINGS.proactive.perDay)))),
 				},
 				security: {
-					agentShell: parsed.security?.agentShell === "readonly" || parsed.security?.agentShell === "off" ? parsed.security.agentShell : "on",
+					agentShell: parsed.security?.agentShell === "full" || parsed.security?.agentShell === "readonly" || parsed.security?.agentShell === "off" ? parsed.security.agentShell : "on",
 				},
 				source: "settings.json",
 			};
@@ -277,8 +274,8 @@ export function validatePatch(patch: unknown): { ok: true; patch: SettingsPatch 
 
 	if (candidate.security) {
 		const access = candidate.security.agentShell;
-		if (access !== undefined && access !== "on" && access !== "readonly" && access !== "off") {
-			return { ok: false, error: "手脚的档位只能是 on / readonly / off" };
+		if (access !== undefined && access !== "full" && access !== "on" && access !== "readonly" && access !== "off") {
+			return { ok: false, error: "手脚的档位只能是 full / on / readonly / off" };
 		}
 		clean.security = {};
 		if (access) clean.security.agentShell = access;
