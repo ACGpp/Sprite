@@ -2,6 +2,10 @@
 
 [中文](CHANGELOG.zh.md) · [README](README_EN.md)
 
+## Unreleased
+
+- Remove the machine-dependent 100 ms CI assertion and its warm-up calls. Keep checks that status queries do not reread journal history, return correct counts and pending messages, and preserve bounded in-memory history.
+
 ## 0.3.5 — 2026-10-10
 
 - First downloadable macOS release, including the changes below.
