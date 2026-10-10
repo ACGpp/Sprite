@@ -2,7 +2,7 @@
 
 [中文](CHANGELOG.zh.md) · [README](README_EN.md)
 
-## 0.3.4 — release candidate
+## 0.3.4 — 2026-10-10
 
 This update collects the changes since the last public code snapshot. It includes the memory and runtime work developed across several local iterations.
 

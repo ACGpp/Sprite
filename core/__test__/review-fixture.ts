@@ -13,7 +13,8 @@ export type PromptCapture = { message: string; tools: string[]; providerKeyMatch
 export function reviewFixture(t: TestContext, label: string) {
 	const root = path.join(process.cwd(), ".core-test");
 	fs.mkdirSync(root, { recursive: true });
-	const homeDir = fs.mkdtempSync(path.join(root, `review-${label}-`));
+	// macOS Unix sockets allow only 103 path bytes. Keep labels short even in CI checkouts.
+	const homeDir = fs.mkdtempSync(path.join(root, `r-${label.slice(0, 12)}-`));
 	const piHome = path.join(homeDir, "pi-home");
 	fs.mkdirSync(piHome);
 	const config: KernelConfig = {
