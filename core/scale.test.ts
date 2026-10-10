@@ -14,6 +14,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 import { openJournal } from "./journal.ts";
 import { createStateTracker } from "./state.ts";
@@ -59,7 +60,7 @@ function buildAgedMemory(name: string) {
 	return { home, runs, total: EVENTS + 3 };
 }
 
-test("规模：查询是 O(1)，内存事件有窗口，计数仍然精确", { timeout: 120_000 }, async () => {
+test("规模：查询是 O(1)，内存事件有窗口，计数仍然精确", { timeout: 120_000 }, async t => {
 	const fixture = buildAgedMemory("scale-aged");
 	const kernel = await startKernel({
 		homeDir: fixture.home,
@@ -70,13 +71,26 @@ test("规模：查询是 O(1)，内存事件有窗口，计数仍然精确", { t
 	});
 
 	try {
-		// 查询延迟：O(n) 退化时这里会是几百毫秒
+		// 查询不能重新读取历史日志；不依赖云端机器速度来判断全量重放退化。
+		const openSync = fs.openSync;
+		const journalDir = path.join(fixture.home, "journal") + path.sep;
+		const historyReads: string[] = [];
+		t.mock.method(fs, "openSync", (...args: Parameters<typeof fs.openSync>) => {
+			const flags = args[1];
+			const readable = typeof flags === "number" ? (flags & fs.constants.O_WRONLY) === 0 : flags.startsWith("r") || flags.includes("+");
+			if (String(args[0]).startsWith(journalDir) && readable) historyReads.push(String(args[0]));
+			return openSync(...args);
+		});
+		// 预热真实 RPC/序列化路径后测稳态延迟；冷启动与并行测试的调度不属于该指标。
+		for (let i = 0; i < 3; i++) await rpcCall(kernel.socketPath, { id: `warm${i}`, type: "query.status" });
 		const latencies: number[] = [];
 		for (let i = 0; i < 5; i++) {
-			const started = Date.now();
+			const started = performance.now();
 			await rpcCall(kernel.socketPath, { id: `q${i}`, type: "query.status" });
-			latencies.push(Date.now() - started);
+			latencies.push(performance.now() - started);
 		}
+		t.diagnostic(`Steady-state status RPC (ms): ${latencies.map(value => value.toFixed(1)).join(", ")}`);
+		assert.deepEqual(historyReads, [], "状态查询不能重新读取历史日志");
 		const worst = Math.max(...latencies);
 		assert.ok(worst < 100, `状态查询必须接近瞬时（实测最慢 ${worst}ms，O(n) 退化时是 1387ms）`);
 

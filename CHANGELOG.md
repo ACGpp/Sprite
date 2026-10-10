@@ -2,6 +2,12 @@
 
 [中文](CHANGELOG.zh.md) · [README](README_EN.md)
 
+## 0.3.5 — 2026-10-10
+
+- First downloadable macOS release, including the changes below.
+- Warm the RPC path before measuring steady-state performance, retain the 100 ms limit, and verify status queries do not reread journal history. This makes the release check meaningful on both Mac architectures.
+- Version 0.3.4 was tagged during release validation; no installers were published for it.
+
 ## 0.3.4 — 2026-10-10
 
 This update collects the changes since the last public code snapshot. It includes the memory and runtime work developed across several local iterations.

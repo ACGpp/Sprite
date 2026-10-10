@@ -39,8 +39,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundleIdentifier</key><string>com.sprite.shell</string>
 	<key>CFBundleExecutable</key><string>Sprite</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>0.3.4</string>
-	<key>CFBundleVersion</key><string>7</string>
+	<key>CFBundleShortVersionString</key><string>0.3.5</string>
+	<key>CFBundleVersion</key><string>8</string>
 	<key>LSMinimumSystemVersion</key><string>14.0</string>
 	<!-- 菜单栏常驻应用：不出现在 Dock，也没有可关闭的主窗口 -->
 	<key>LSUIElement</key><true/>
