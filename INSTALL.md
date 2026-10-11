@@ -17,7 +17,7 @@ The menu-bar app appears while its background service is prepared. On a new acco
 - App: `/Applications/Sprite.app` (or your user Applications folder).
 - Runtime versions: `~/Library/Application Support/Sprite/releases/`.
 - Background service: `~/Library/LaunchAgents/com.sprite.core.plist`.
-- Memory: `~/.claude-memory/`.
+- Memory home (legacy compatibility path): `~/.claude-memory/`; see the [README memory section](README_EN.md#memory-and-privacy) for its contents.
 - Diagnostics: `~/Library/Logs/sprite-core.log` and `sprite-core.err.log`.
 
 Once connected, choose a provider and model in Settings, save your key, and send a first message. Ejecting the DMG does not stop the installed service.

@@ -50,7 +50,26 @@ Free action uses your macOS account's permissions and is not a sandbox. Sprite c
 
 ## Memory and privacy
 
-Memory lives in `~/.claude-memory/`. Conversations and memory excerpts included in context are sent to your configured model provider. Free action can access the network, and system speech recognition may send audio to Apple.
+Sprite's memory home is the local directory `~/.claude-memory/`. This is a compatibility path from earlier versions, not a single “memory file”; existing installations still read and write here, so changing it requires a dedicated migration.
+
+The main contents are:
+
+```text
+~/.claude-memory/
+├── identity.md                 its evolving identity and personality
+├── journal/                    append-only events, the source of truth
+├── diary/  notes/              diaries and notes
+├── explorations/  private/     exploration records and its own space
+├── context/                    working memory and agreements under review
+├── conversations/mailbox.md   human-readable conversation projection
+├── thoughts/stream.jsonl       thought-stream projection
+├── voice/                      original voice recordings
+├── config/settings.json        model, rhythm, proactive and permission settings
+├── sessions/                   daily model sessions
+└── runtime/                    kernel sockets, versions and runtime files
+```
+
+`journal/` records durable facts and the other projections are derived from it. Original diaries, notes, identity and recordings cannot all be reconstructed from the journal. Conversations and memory excerpts included in context are sent to your configured model provider. Free action can access the network, and system speech recognition may send audio to Apple.
 
 Back up the **entire memory directory**: not all original diaries, notes or recordings can be reconstructed from the event journal. Version restores cover content managed by dedicated memory tools; direct Shell edits do not automatically receive the same version receipts.
 

@@ -17,7 +17,7 @@ Apple Silicon 选择 `arm64.dmg`，Intel 选择 `x64.dmg`；点击苹果菜单 �
 - 应用：`/Applications/Sprite.app`，也可放在用户的 Applications 文件夹。
 - 运行环境版本：`~/Library/Application Support/Sprite/releases/`。
 - 后台服务：`~/Library/LaunchAgents/com.sprite.core.plist`。
-- 记忆：`~/.claude-memory/`。
+- 记忆之家（早期兼容路径）：`~/.claude-memory/`；目录内容见 [README 的记忆说明](README.md#记忆与隐私)。
 - 诊断日志：`~/Library/Logs/sprite-core.log` 和 `sprite-core.err.log`。
 
 连接后，在设置中选择供应商与模型，保存密钥，发送第一句话。弹出 DMG 不影响已安装的后台服务。
